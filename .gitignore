@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test output
+coverage/
+
+# Environment secrets
+.env
+.env.local
+
+# Runtime data
+data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor and operating system
+.vscode/
+.DS_Store
+Thumbs.db   
