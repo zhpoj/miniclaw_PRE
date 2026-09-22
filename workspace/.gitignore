@@ -1,0 +1,4 @@
+# 工作区是被 agent 操作的数据，不由本仓库跟踪
+*
+!.gitignore
+!README.md

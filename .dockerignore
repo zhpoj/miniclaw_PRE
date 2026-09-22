@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+web/node_modules
+web/dist
+dist
+coverage
+workspace
+*.log
+.env
+.env.*
+Dockerfile
+docker-compose.yml

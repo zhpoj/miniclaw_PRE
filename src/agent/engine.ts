@@ -6,12 +6,22 @@ import {
   type AgentRunDefaults,
   type AgentRunRequest,
 } from './run.js';
+import {
+  defaultToolsForMode,
+  mapWorkspacePath,
+  resolveWorkspace,
+  workspaceExists,
+  type ExecutionMode,
+  type WorkspaceConfig,
+} from './workspace.js';
 
 export const ENGINE_NAME = '@earendil-works/pi-coding-agent';
 
 export interface AgentEngineOptions {
-  /** Working directory used by runs that do not specify one. */
+  /** Working directory used by runs that do not specify one. Wins over the workspace default. */
   cwd?: string;
+  /** Execution mode + workspace mapping. Resolved from the environment when omitted. */
+  workspace?: WorkspaceConfig;
   /** pi agent config directory (defaults to `~/.pi/agent`). */
   agentDir?: string;
   /** Tool allowlist used when a run does not specify one. */
@@ -26,6 +36,14 @@ export interface AgentEngineInfo {
   engine: string;
   version: string;
   cwd: string;
+  /** Execution mode of the workspace: host or container. */
+  mode: ExecutionMode;
+  workspace: {
+    hostPath: string | null;
+    containerPath: string;
+    /** False when the workspace directory that is in effect does not exist. */
+    exists: boolean;
+  };
   defaultTools: string[];
   persistSessions: boolean;
   activeRuns: number;
@@ -53,17 +71,24 @@ export function defaultToolsForPlatform(platform: string = process.platform): st
 export class AgentEngine {
   private readonly runs = new Map<string, AgentRun>();
   private readonly defaults: AgentRunDefaults;
+  private readonly workspace: WorkspaceConfig;
   private readonly allowModelNetwork: boolean;
   private runtimePromise: Promise<ModelRuntime> | undefined;
 
   constructor(options: AgentEngineOptions = {}) {
+    this.workspace = options.workspace ?? resolveWorkspace();
     this.defaults = {
-      cwd: options.cwd ?? process.cwd(),
+      cwd: options.cwd ?? this.workspace.activePath,
       agentDir: options.agentDir,
-      tools: options.defaultTools ?? defaultToolsForPlatform(),
+      tools: options.defaultTools ?? defaultToolsForMode(this.workspace.mode),
       persistSessions: options.persistSessions ?? false,
     };
     this.allowModelNetwork = options.allowModelNetwork ?? false;
+  }
+
+  /** Resolved execution mode + workspace mapping. */
+  getWorkspace(): WorkspaceConfig {
+    return { ...this.workspace };
   }
 
   /** Lazily created, process-wide model/auth runtime. */
@@ -80,7 +105,11 @@ export class AgentEngine {
 
   async createRun(request: AgentRunRequest = {}): Promise<AgentRun> {
     const modelRuntime = await this.getModelRuntime();
-    const run = await AgentRun.create(modelRuntime, request, this.defaults);
+    const resolved: AgentRunRequest =
+      request.cwd === undefined
+        ? request
+        : { ...request, cwd: mapWorkspacePath(request.cwd, this.workspace) };
+    const run = await AgentRun.create(modelRuntime, resolved, this.defaults);
     this.runs.set(run.id, run);
     return run;
   }
@@ -122,6 +151,12 @@ export class AgentEngine {
       engine: ENGINE_NAME,
       version: VERSION,
       cwd: this.defaults.cwd,
+      mode: this.workspace.mode,
+      workspace: {
+        hostPath: this.workspace.hostPath,
+        containerPath: this.workspace.containerPath,
+        exists: workspaceExists(this.workspace),
+      },
       defaultTools: [...this.defaults.tools],
       persistSessions: this.defaults.persistSessions,
       activeRuns: [...this.runs.values()].filter((run) => run.isBusy).length,

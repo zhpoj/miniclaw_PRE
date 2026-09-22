@@ -7,6 +7,8 @@ const port = Number(process.env.PORT ?? 3000);
 const engine = createEngineFromEnv();
 const app = createApp({ engine });
 
+const info = engine.describe();
+
 const server = serve(
   {
     fetch: app.fetch,
@@ -17,8 +19,16 @@ const server = serve(
       `MiniAgent server is running at http://localhost:${serverInfo.port}`,
     );
     console.log(
-      `Agent engine: ${engine.describe().engine}@${engine.describe().version} (cwd: ${engine.describe().cwd})`,
+      `Agent engine: ${info.engine}@${info.version} (mode: ${info.mode}, cwd: ${info.cwd})`,
     );
+    if (info.workspace.hostPath) {
+      console.log(`Workspace: host ${info.workspace.hostPath} -> ${info.workspace.containerPath}`);
+    }
+    if (!info.workspace.exists) {
+      console.warn(
+        `[warn] workspace directory does not exist: ${info.cwd} (set AGENT_CWD / AGENT_WORKSPACE_HOST to a real directory)`,
+      );
+    }
   },
 );
 

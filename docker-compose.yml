@@ -1,0 +1,41 @@
+services:
+  miniclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: miniclaw:latest
+    container_name: miniclaw
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      # 执行模式：container（服务在容器内跑）/ host（服务在宿主机跑）
+      AGENT_EXEC_MODE: "container"
+      # agent 的工作目录（容器内路径，见 volumes）
+      AGENT_CWD: /workspace
+      # 宿主机侧工作区，用于把调用方传入的宿主机路径映射为容器内路径
+      AGENT_WORKSPACE_HOST: ${WORKSPACE_PATH:-./workspace}
+      # 首次启动允许联网拉取模型目录，之后会缓存到 pi 配置卷
+      AGENT_ALLOW_MODEL_NETWORK: "1"
+      # 工具白名单，逗号分隔；Linux 容器默认 read,bash,edit,write
+      # AGENT_TOOLS: read,bash,edit,write,grep,find,ls
+      # 默认模型，例如 anthropic/claude-sonnet-4-5 或 anthropic/claude-sonnet-4-5:high
+      # AGENT_MODEL: anthropic/claude-sonnet-4-5
+      # 模型鉴权：可以用 provider 环境变量，或挂载已登录的 ~/.pi/agent/auth.json
+      # ANTHROPIC_API_KEY: sk-ant-...
+      # OPENAI_API_KEY: sk-...
+      # GEMINI_API_KEY: ...
+      # DeepSeek 鉴权（容器使用独立 named volume，不读宿主机 ~/.pi/agent，
+      # 故走环境变量；真实值放在 .env（已被 gitignore），由 ${DEEPSEEK_API_KEY} 注入）
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      # 开启后 pi 会话会落盘到 ~/.pi/agent/sessions
+      # AGENT_PERSIST_SESSIONS: "1"
+    volumes:
+      # 宿主机工作区 → 容器 /workspace；改 .env 里的 WORKSPACE_PATH 即可换目录（支持仓库外绝对路径）
+      - ${WORKSPACE_PATH:-./workspace}:/workspace
+      # pi 的 auth.json / models.json 缓存（容器用户 home 为 /home/miniclaw）
+      - miniclaw-pi-config:/home/miniclaw/.pi
+    restart: unless-stopped
+
+volumes:
+  miniclaw-pi-config:
