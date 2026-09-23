@@ -34,6 +34,16 @@ export interface MountedIM {
   readonly bridge: IMBridge | undefined;
 }
 
+/** Starts every configured channel transport. */
+export async function startMountedIM(im: MountedIM | undefined): Promise<void> {
+  for (const channel of im?.channels ?? []) await channel.start();
+}
+
+/** Stops every configured channel transport. */
+export async function stopMountedIM(im: MountedIM | undefined): Promise<void> {
+  await Promise.all((im?.channels ?? []).map((channel) => channel.stop()));
+}
+
 /**
  * Mounts every configured IM channel onto the HTTP app.
  * A channel only mounts when its env credentials are present, so the server

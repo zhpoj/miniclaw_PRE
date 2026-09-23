@@ -1,4 +1,5 @@
 import { createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
+import * as Lark from '@larksuiteoapi/node-sdk';
 
 import type {
   ChannelCapabilities,
@@ -26,7 +27,16 @@ export interface FeishuConfig {
   baseUrl?: string;
   /** How `conversationId` is addressed when sending. Feishu chats use `chat_id`. */
   receiveIdType?: 'chat_id' | 'open_id';
+  /** Receive events over the official WebSocket client or the HTTP webhook. */
+  connectionMode?: 'websocket' | 'webhook';
 }
+
+export interface FeishuEventTransport {
+  start(handler: (event: Record<string, unknown>) => Promise<void>): Promise<void>;
+  stop(): Promise<void>;
+}
+
+export type FeishuEventTransportFactory = (config: FeishuConfig) => FeishuEventTransport;
 
 /**
  * Builds the Feishu config from the environment, returning null when the
@@ -35,6 +45,7 @@ export interface FeishuConfig {
  * - `FEISHU_ENCRYPT_KEY` (optional)
  * - `FEISHU_BASE_URL` (optional, defaults to `https://open.feishu.cn`)
  * - `FEISHU_RECEIVE_ID_TYPE` (optional, `chat_id` | `open_id`)
+ * - `FEISHU_CONNECTION_MODE` (optional, `websocket` | `webhook`; defaults to `websocket`)
  */
 export function createFeishuConfigFromEnv(
   env: NodeJS.ProcessEnv = process.env,
@@ -47,12 +58,15 @@ export function createFeishuConfigFromEnv(
   const baseUrl = env['FEISHU_BASE_URL']?.trim() || FEISHU_BASE_URL;
   const receiveIdType =
     env['FEISHU_RECEIVE_ID_TYPE']?.trim() === 'open_id' ? 'open_id' : 'chat_id';
+  const connectionMode =
+    env['FEISHU_CONNECTION_MODE']?.trim() === 'webhook' ? 'webhook' : 'websocket';
 
   return {
     appId,
     appSecret,
     baseUrl,
     receiveIdType,
+    connectionMode,
     ...(encryptKey ? { encryptKey } : {}),
   };
 }
@@ -78,18 +92,41 @@ export class FeishuChannel implements IMChannel {
 
   private readonly config: FeishuConfig;
   private readonly handlers = new Set<InboundMessageHandler>();
+  private readonly transportFactory: FeishuEventTransportFactory;
   private token: { value: string; expiresAt: number } | null = null;
+  private transport: FeishuEventTransport | null = null;
 
-  constructor(config: FeishuConfig) {
+  constructor(
+    config: FeishuConfig,
+    transportFactory: FeishuEventTransportFactory = createLarkTransport,
+  ) {
     this.config = config;
+    this.transportFactory = transportFactory;
   }
 
   async start(): Promise<void> {
     this.token = null;
+    if ((this.config.connectionMode ?? 'websocket') === 'webhook' || this.transport) return;
+
+    const transport = this.transportFactory(this.config);
+    this.transport = transport;
+    try {
+      await transport.start(async (event) => {
+        const message = this.toInboundMessage(event);
+        if (message) await this.dispatch(message);
+      });
+    } catch (error) {
+      this.transport = null;
+      await transport.stop().catch(() => undefined);
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
     this.token = null;
+    const transport = this.transport;
+    this.transport = null;
+    if (transport) await transport.stop();
   }
 
   onMessage(handler: InboundMessageHandler): () => void {
@@ -258,15 +295,15 @@ export class FeishuChannel implements IMChannel {
     const conversationId = readString(message['chat_id']);
     if (!messageId || !conversationId) return null;
 
-    // TODO(im): support image/file/post messages once the agent side can consume them.
-    if (readString(message['message_type']) !== 'text') return null;
+    const messageType = readString(message['message_type']);
+    if (messageType !== 'text' && messageType !== 'post') return null;
 
     return {
       channelId: this.id,
       conversationId,
       messageId,
       senderId: readSenderId(event['sender'] ?? message['sender']),
-      text: readMessageText(message['content']),
+      text: readMessageText(message['content'], messageType),
       raw: message,
     };
   }
@@ -339,6 +376,45 @@ export class FeishuChannel implements IMChannel {
   }
 }
 
+function createLarkTransport(config: FeishuConfig): FeishuEventTransport {
+  let client: Lark.WSClient | null = null;
+
+  return {
+    async start(handler) {
+      const dispatcher = new Lark.EventDispatcher({
+        ...(config.encryptKey ? { encryptKey: config.encryptKey } : {}),
+      }).register({
+        'im.message.receive_v1': async (event) => {
+          const payload = event as unknown as Record<string, unknown>;
+          const nested = isRecord(payload['event']) ? payload['event'] : payload;
+          const message = isRecord(nested['message']) ? nested['message'] : undefined;
+          console.log('[feishu] received message event', {
+            payloadKeys: Object.keys(payload),
+            eventKeys: Object.keys(nested),
+            messageKeys: message ? Object.keys(message) : [],
+            messageType: message?.['message_type'],
+          });
+          await handler(payload);
+        },
+      });
+      client = new Lark.WSClient({
+        appId: config.appId,
+        appSecret: config.appSecret,
+        domain: Lark.Domain.Feishu,
+        autoReconnect: true,
+        handshakeTimeoutMs: 15_000,
+        loggerLevel: Lark.LoggerLevel.info,
+        source: 'miniclaw',
+      });
+      await client.start({ eventDispatcher: dispatcher });
+    },
+    async stop() {
+      client?.close({ force: true });
+      client = null;
+    },
+  };
+}
+
 export function computeFeishuSignature(
   encryptKey: string,
   timestamp: string,
@@ -377,11 +453,12 @@ function readSenderId(sender: unknown): string {
   return readString(senderId) ?? 'unknown';
 }
 
-function readMessageText(content: unknown): string {
+function readMessageText(content: unknown, messageType = 'text'): string {
   if (typeof content !== 'string') return '';
   try {
     const parsed = JSON.parse(content) as unknown;
     if (isRecord(parsed)) {
+      if (messageType === 'post') return stripMentions(readPostText(parsed));
       const text = readString(parsed['text']);
       if (text) return stripMentions(text);
     }
@@ -389,6 +466,22 @@ function readMessageText(content: unknown): string {
     // Not JSON: fall back to the raw string below.
   }
   return stripMentions(content);
+}
+
+function readPostText(post: Record<string, unknown>): string {
+  const content = Array.isArray(post['content'])
+    ? post['content']
+    : Object.values(post).find(
+        (value): value is Record<string, unknown> =>
+          isRecord(value) && Array.isArray(value['content']),
+      )?.['content'];
+  if (!Array.isArray(content)) return '';
+
+  return content
+    .flatMap((paragraph) => (Array.isArray(paragraph) ? paragraph : []))
+    .map((element) => (isRecord(element) ? readString(element['text']) ?? '' : ''))
+    .join('')
+    .trim();
 }
 
 /** Feishu replaces mentions with placeholders such as `@_user_1`. */

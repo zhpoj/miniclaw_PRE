@@ -2,7 +2,7 @@ import { serve } from '@hono/node-server';
 
 import { createApp } from './app.js';
 import { createEngineFromEnv } from './agent/engine.js';
-import { getMountedIM } from './im/index.js';
+import { getMountedIM, startMountedIM, stopMountedIM } from './im/index.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const engine = createEngineFromEnv();
@@ -43,6 +43,14 @@ const server = serve(
   },
 );
 
+void startMountedIM(im)
+  .then(() => {
+    if ((im?.channels.length ?? 0) > 0) console.log('IM transports: started');
+  })
+  .catch((error: unknown) => {
+    console.error('Failed to start IM transports:', error);
+  });
+
 let shuttingDown = false;
 function shutdown(signal: string): void {
   if (shuttingDown) return;
@@ -50,6 +58,7 @@ function shutdown(signal: string): void {
   console.log(`Received ${signal}, closing agent runs...`);
   void engine
     .closeAll()
+    .then(() => stopMountedIM(im))
     .catch((error: unknown) => {
       console.error('Failed to close agent runs:', error);
     })

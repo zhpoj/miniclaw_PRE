@@ -1,6 +1,6 @@
 import { createCipheriv } from 'node:crypto';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../src/app.js';
 import {
@@ -8,6 +8,7 @@ import {
   createFeishuConfigFromEnv,
   FeishuChannel,
 } from '../src/im/feishu.js';
+import { startMountedIM, stopMountedIM } from '../src/im/index.js';
 
 const ENCRYPT_KEY = Buffer.alloc(32, 7).toString('base64');
 
@@ -93,7 +94,101 @@ describe('createFeishuConfigFromEnv', () => {
       encryptKey: ENCRYPT_KEY,
       baseUrl: 'https://open.feishu.cn',
       receiveIdType: 'chat_id',
+      connectionMode: 'websocket',
     });
+  });
+
+  it('allows webhook mode to be selected explicitly', () => {
+    expect(
+      createFeishuConfigFromEnv({
+        FEISHU_APP_ID: 'cli_1',
+        FEISHU_APP_SECRET: 'secret_1',
+        FEISHU_CONNECTION_MODE: 'webhook',
+      }),
+    ).toMatchObject({ connectionMode: 'webhook' });
+  });
+});
+
+describe('FeishuChannel long connection', () => {
+  it('starts the transport and dispatches received events', async () => {
+    let receive: ((event: Record<string, unknown>) => Promise<void>) | undefined;
+    let stopped = false;
+    const channel = new FeishuChannel(
+      {
+        appId: 'cli_1',
+        appSecret: 'secret_1',
+        connectionMode: 'websocket',
+      },
+      () => ({
+        start(handler) {
+          receive = handler;
+          return Promise.resolve();
+        },
+        stop() {
+          stopped = true;
+          return Promise.resolve();
+        },
+      }),
+    );
+    const received: string[] = [];
+    channel.onMessage((message) => {
+      received.push(message.text);
+    });
+
+    await channel.start();
+    await receive?.(makeTextMessageEvent().event);
+    await channel.stop();
+
+    expect(received).toEqual(['hello agent']);
+    expect(stopped).toBe(true);
+  });
+
+  it('does not create a long connection in webhook mode', async () => {
+    let created = false;
+    const channel = new FeishuChannel(
+      {
+        appId: 'cli_1',
+        appSecret: 'secret_1',
+        connectionMode: 'webhook',
+      },
+      () => {
+        created = true;
+        throw new Error('webhook mode must not create a transport');
+      },
+    );
+
+    await channel.start();
+
+    expect(created).toBe(false);
+  });
+});
+
+describe('mounted IM lifecycle', () => {
+  it('starts and stops configured channel transports', async () => {
+    const states: string[] = [];
+    const channel = new FeishuChannel(
+      {
+        appId: 'cli_1',
+        appSecret: 'secret_1',
+        connectionMode: 'websocket',
+      },
+      () => ({
+        start() {
+          states.push('started');
+          return Promise.resolve();
+        },
+        stop() {
+          states.push('stopped');
+          return Promise.resolve();
+        },
+      }),
+    );
+    const mounted = { channels: [channel], bridge: undefined };
+
+    await startMountedIM(mounted);
+    await stopMountedIM(mounted);
+
+    expect(states).toEqual(['started', 'stopped']);
   });
 });
 
@@ -167,6 +262,26 @@ describe('FeishuChannel.handleWebhook', () => {
     );
     expect(afterUnsubscribe.status).toBe(200);
     expect(received).toHaveLength(1);
+  });
+
+  it('normalizes an inbound rich-text post message', async () => {
+    const received: Parameters<Parameters<FeishuChannel['onMessage']>[0]>[0][] = [];
+    const unsubscribe = channel.onMessage((message) => {
+      received.push(message);
+    });
+    const event = makeTextMessageEvent();
+    event.event.message.message_type = 'post';
+    event.event.message.content = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'text', text: '诊断3', style: [] }]],
+    });
+
+    const result = await channel.handleWebhook(JSON.stringify(event));
+
+    expect(result.status).toBe(200);
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ text: '诊断3' });
+    unsubscribe();
   });
 
   it('ignores non-text messages', async () => {
@@ -247,6 +362,12 @@ describe('FeishuChannel outbound', () => {
 
 describe('IM mounting', () => {
   const envBackup = { ...process.env };
+
+  beforeEach(() => {
+    for (const key of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET']) {
+      delete process.env[key];
+    }
+  });
 
   afterEach(() => {
     for (const key of ['FEISHU_APP_ID', 'FEISHU_APP_SECRET']) {
