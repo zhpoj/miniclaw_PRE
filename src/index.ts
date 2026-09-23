@@ -2,10 +2,12 @@ import { serve } from '@hono/node-server';
 
 import { createApp } from './app.js';
 import { createEngineFromEnv } from './agent/engine.js';
+import { getMountedIM } from './im/index.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const engine = createEngineFromEnv();
 const app = createApp({ engine });
+const im = getMountedIM(app);
 
 const info = engine.describe();
 
@@ -27,6 +29,15 @@ const server = serve(
     if (!info.workspace.exists) {
       console.warn(
         `[warn] workspace directory does not exist: ${info.cwd} (set AGENT_CWD / AGENT_WORKSPACE_HOST to a real directory)`,
+      );
+    }
+    const channels = im?.channels ?? [];
+    if (channels.length === 0) {
+      console.log('IM channels: none configured (set FEISHU_APP_ID / FEISHU_APP_SECRET to enable)');
+    } else {
+      console.log(`IM channels: ${channels.map((channel) => channel.id).join(', ')}`);
+      console.log(
+        `IM webhook: ${channels.map((channel) => `/api/im/${channel.id}/webhook`).join(', ')}`,
       );
     }
   },

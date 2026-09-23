@@ -5,6 +5,7 @@ import { z } from 'zod';
 
 import { AgentEngine, createEngineFromEnv, ENGINE_NAME } from './agent/engine.js';
 import { AgentEngineError } from './agent/run.js';
+import { mountIMChannels } from './im/index.js';
 
 const createRunSchema = z.object({
   cwd: z.string().min(1).optional(),
@@ -181,6 +182,10 @@ export function createApp(options: CreateAppOptions = {}) {
     }
     return context.json({ id, closed: true });
   });
+
+  // IM channels are opt-in: each one mounts only when its credentials are in the env.
+  // With the engine present, inbound messages are forwarded to per-conversation agent runs.
+  mountIMChannels(app, { engine });
 
   return app;
 }
