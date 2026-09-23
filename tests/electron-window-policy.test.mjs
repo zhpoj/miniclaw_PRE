@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises'
+
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -16,6 +18,15 @@ describe('Electron window policy', () => {
         sandbox: true,
       },
     })
+  })
+
+  it('exposes the documented desktop development command', async () => {
+    const pkg = JSON.parse(
+      await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+    )
+
+    expect(pkg.scripts['desktop:dev']).toBe('electron electron/main.mjs')
+    expect(pkg.devDependencies.electron).toBe('^44.4.5')
   })
 
   it.each([

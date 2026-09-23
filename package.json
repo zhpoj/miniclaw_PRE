@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx watch src/index.ts",
     "dev:full": "node run-dev.mjs",
+    "desktop:dev": "electron electron/main.mjs",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "docker:build": "docker build -t miniclaw:latest ."
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
+    "electron": "^44.4.5",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.1"
