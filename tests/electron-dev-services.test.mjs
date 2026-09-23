@@ -2,7 +2,10 @@ import { EventEmitter } from 'node:events'
 
 import { describe, expect, it, vi } from 'vitest'
 
-import { createDevServiceManager } from '../electron/dev-services.mjs'
+import {
+  createDevServiceManager,
+  spawnConfiguredService,
+} from '../electron/dev-services.mjs'
 
 function child(pid = 41) {
   const emitter = new EventEmitter()
@@ -24,6 +27,25 @@ const backend = {
 }
 
 describe('Electron development service manager', () => {
+  it('runs a Windows command shim through cmd.exe without enabling shell mode', () => {
+    const spawned = child(91)
+    const spawnImpl = vi.fn(() => spawned)
+    const service = { ...backend, command: 'npm.cmd', args: ['--version'] }
+
+    const result = spawnConfiguredService(service, {
+      spawnImpl,
+      platform: 'win32',
+      commandShell: 'C:\\Windows\\System32\\cmd.exe',
+    })
+
+    expect(result).toBe(spawned)
+    expect(spawnImpl).toHaveBeenCalledWith(
+      'C:\\Windows\\System32\\cmd.exe',
+      ['/d', '/s', '/c', 'npm.cmd', '--version'],
+      expect.objectContaining({ shell: false, windowsHide: true }),
+    )
+  })
+
   it('reuses a recognized service and never kills it', async () => {
     const spawnService = vi.fn()
     const killTree = vi.fn()

@@ -55,8 +55,21 @@ function prefixOutput(stream, name, destination) {
   })
 }
 
-function spawnConfiguredService(service) {
-  const child = spawn(service.command, service.args, {
+export function spawnConfiguredService(
+  service,
+  {
+    spawnImpl = spawn,
+    platform = process.platform,
+    commandShell = process.env.ComSpec ?? 'cmd.exe',
+  } = {},
+) {
+  const isWindowsShim =
+    platform === 'win32' && /\.(?:cmd|bat)$/i.test(service.command)
+  const command = isWindowsShim ? commandShell : service.command
+  const args = isWindowsShim
+    ? ['/d', '/s', '/c', service.command, ...service.args]
+    : service.args
+  const child = spawnImpl(command, args, {
     cwd: service.cwd,
     env: service.env,
     shell: false,
