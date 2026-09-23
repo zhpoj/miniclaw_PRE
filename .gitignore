@@ -21,4 +21,7 @@ npm-debug.log*
 # Editor and operating system
 .vscode/
 .DS_Store
-Thumbs.db   
+Thumbs.db
+
+# Isolated feature worktrees
+.worktrees/
