@@ -8,8 +8,9 @@ import type {
   ReliabilityStatus,
 } from './reliability.js';
 import type { UsageLedgerEntry, UsageLedgerFilter, UsageLedgerRow } from './usage.js';
+import type { ScheduledTask, TaskRun, TaskRunResult } from '../scheduler/task-store.js';
 
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 
 export interface StoredMessageInput {
   channelId: string;
@@ -294,6 +295,70 @@ export class SqliteStore {
     }));
   }
 
+  upsertTask(input: ScheduledTask): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO scheduled_tasks(id, name, schedule, conversation_id, payload_json, enabled, next_run_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name = excluded.name, schedule = excluded.schedule,
+        conversation_id = excluded.conversation_id, payload_json = excluded.payload_json,
+        enabled = excluded.enabled, next_run_at = excluded.next_run_at, updated_at = excluded.updated_at
+    `).run(input.id, input.name, input.schedule, input.conversationId, JSON.stringify(input.payload), input.enabled ? 1 : 0, input.nextRunAt, input.createdAt ?? now, now);
+  }
+
+  getDueTasks(now: string): ScheduledTask[] {
+    const rows = this.db.prepare(`
+      SELECT id, name, schedule, conversation_id, payload_json, enabled, next_run_at, created_at, updated_at
+      FROM scheduled_tasks WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at, id
+    `).all(now) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.readTask(row));
+  }
+
+  claimTaskRun(taskId: string, now: string): TaskRun | undefined {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.db.prepare('SELECT id FROM scheduled_tasks WHERE id = ? AND enabled = 1 AND next_run_at <= ?').get(taskId, now);
+      if (!task) { this.db.exec('COMMIT'); return undefined; }
+      const active = this.db.prepare("SELECT id FROM task_runs WHERE task_id = ? AND status = 'running'").get(taskId);
+      if (active) { this.db.exec('COMMIT'); return undefined; }
+      const id = randomUUID();
+      this.db.prepare("INSERT INTO task_runs(id, task_id, status, started_at) VALUES (?, ?, 'running', ?)").run(id, taskId, now);
+      this.db.exec('COMMIT');
+      return { id, taskId, status: 'running', startedAt: now };
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw error;
+    }
+  }
+
+  finishTaskRun(runId: string, result: TaskRunResult): void {
+    const finishedAt = result.finishedAt ?? new Date().toISOString();
+    this.db.prepare('UPDATE task_runs SET status = ?, run_id = ?, finished_at = ?, error = ? WHERE id = ? AND status = ?')
+      .run(result.status, result.runId ?? null, finishedAt, result.error ?? null, runId, 'running');
+  }
+
+  getTaskRuns(taskId: string): TaskRun[] {
+    const rows = this.db.prepare('SELECT id, task_id, run_id, status, started_at, finished_at, error FROM task_runs WHERE task_id = ? ORDER BY started_at, id').all(taskId) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row['id']), taskId: String(row['task_id']),
+      ...(row['run_id'] === null ? {} : { runId: String(row['run_id']) }),
+      status: String(row['status']) as TaskRun['status'], startedAt: String(row['started_at']),
+      ...(row['finished_at'] === null ? {} : { finishedAt: String(row['finished_at']) }),
+      ...(row['error'] === null ? {} : { error: String(row['error']) }),
+    }));
+  }
+
+  disableTask(id: string): void {
+    this.db.prepare('UPDATE scheduled_tasks SET enabled = 0, updated_at = ? WHERE id = ?').run(new Date().toISOString(), id);
+  }
+
+  recoverScheduledTasks(now: string): string | undefined {
+    this.db.prepare("UPDATE task_runs SET status = 'failed', finished_at = ?, error = ? WHERE status = 'running'")
+      .run(now, 'recovered after process restart');
+    const row = this.db.prepare('SELECT MIN(next_run_at) AS next_run_at FROM scheduled_tasks WHERE enabled = 1 AND next_run_at >= ?').get(now) as { next_run_at: string | null };
+    return row.next_run_at ?? undefined;
+  }
+
   private readReliability(id: string): ReliabilityQueueItem | undefined {
     const row = this.db.prepare(`
       SELECT id, channel_id, conversation_id, idempotency_key, payload_json,
@@ -317,6 +382,15 @@ export class SqliteStore {
       lastError: row.last_error ?? undefined,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+    };
+  }
+
+  private readTask(row: Record<string, unknown>): ScheduledTask {
+    return {
+      id: String(row['id']), name: String(row['name']), schedule: String(row['schedule']),
+      conversationId: String(row['conversation_id']), payload: JSON.parse(String(row['payload_json'])) as Record<string, unknown>,
+      enabled: Number(row['enabled']) === 1, nextRunAt: String(row['next_run_at']),
+      createdAt: String(row['created_at']), updatedAt: String(row['updated_at']),
     };
   }
 
@@ -413,6 +487,30 @@ export class SqliteStore {
       );
       CREATE INDEX IF NOT EXISTS idx_usage_model_created
         ON usage_ledger(model, created_at);
+      CREATE TABLE IF NOT EXISTS scheduled_tasks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        schedule TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        next_run_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+        ON scheduled_tasks(enabled, next_run_at);
+      CREATE TABLE IF NOT EXISTS task_runs (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES scheduled_tasks(id),
+        run_id TEXT,
+        status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'failed')),
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        error TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_runs_active
+        ON task_runs(task_id, status);
     `);
     if (version < 2) {
       const columns = this.db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;

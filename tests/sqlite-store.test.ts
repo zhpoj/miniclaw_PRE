@@ -19,7 +19,7 @@ describe('SqliteStore', () => {
     const store = new SqliteStore(join(dir, 'data', 'db', 'messages.db'));
 
     expect(store.path).toContain('messages.db');
-    expect(store.schemaVersion()).toBe(4);
+    expect(store.schemaVersion()).toBe(5);
     expect(store.tables()).toEqual(expect.arrayContaining([
       'schema_migrations', 'conversations', 'messages', 'workspaces', 'agent_profiles',
     ]));
@@ -33,7 +33,7 @@ describe('SqliteStore', () => {
     const first = new SqliteStore(path);
     first.close();
     const second = new SqliteStore(path);
-    expect(second.schemaVersion()).toBe(4);
+    expect(second.schemaVersion()).toBe(5);
     second.close();
   });
 

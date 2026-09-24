@@ -8,11 +8,13 @@ import { SqliteStore } from './storage/sqlite.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const store = new SqliteStore();
+const nextScheduledTaskAt = store.recoverScheduledTasks(new Date().toISOString());
 const engine = createEngineFromEnv({ store });
 const app = createApp({ engine, store });
 const im = getMountedIM(app);
 
 const info = engine.describe();
+if (nextScheduledTaskAt) console.log(`Scheduled tasks recovered; next due at ${nextScheduledTaskAt}`);
 
 const server = serve(
   {
