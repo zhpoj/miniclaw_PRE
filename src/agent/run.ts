@@ -16,6 +16,7 @@ import {
 
 import {
   ApprovalManager,
+  type FeishuApprovalPrincipal,
   type PromptSource,
 } from './approval.js';
 
@@ -86,16 +87,24 @@ export interface PromptResult {
 export interface PromptOptions {
   streamingBehavior?: 'steer' | 'followUp';
   source?: PromptSource;
+  principal?: FeishuApprovalPrincipal;
 }
 
 interface ActiveTurn {
   id: string;
   source: PromptSource;
+  principal?: FeishuApprovalPrincipal;
 }
 
 interface QueuedTurn {
   token: string;
   source: PromptSource;
+  principal?: FeishuApprovalPrincipal;
+}
+
+interface TurnContext {
+  source: PromptSource;
+  principal?: FeishuApprovalPrincipal;
 }
 
 export class AgentTurnApprovals {
@@ -112,12 +121,12 @@ export class AgentTurnApprovals {
     return this.active;
   }
 
-  start(source: PromptSource): void {
-    this.replace(source, true);
+  start(context: TurnContext): void {
+    this.replace(context, true);
   }
 
-  queue(source: PromptSource): () => void {
-    const entry = { token: randomUUID(), source };
+  queue(context: TurnContext): () => void {
+    const entry = { token: randomUUID(), ...context };
     this.queued.push(entry);
     return () => {
       const index = this.queued.findIndex((candidate) => candidate.token === entry.token);
@@ -130,8 +139,8 @@ export class AgentTurnApprovals {
       this.waitingForInitialTurnStart = false;
       return;
     }
-    const source = this.queued.shift()?.source ?? this.active?.source ?? 'web';
-    this.replace(source, false);
+    const context = this.queued.shift() ?? this.active ?? { source: 'web' };
+    this.replace(context, false);
   }
 
   end(reason: string): void {
@@ -141,11 +150,17 @@ export class AgentTurnApprovals {
     this.waitingForInitialTurnStart = false;
   }
 
-  private replace(source: PromptSource, waitingForInitialTurnStart: boolean): void {
+  private replace(context: TurnContext, waitingForInitialTurnStart: boolean): void {
     if (this.active) this.approvals.endTurn(this.runId, '上一轮任务已结束');
-    this.active = { id: randomUUID(), source };
+    this.active = {
+      id: randomUUID(),
+      source: context.source,
+      ...(context.source === 'feishu' && context.principal
+        ? { principal: context.principal }
+        : {}),
+    };
     this.waitingForInitialTurnStart = waitingForInitialTurnStart;
-    this.approvals.beginTurn(this.runId, this.active.id, source);
+    this.approvals.beginTurn(this.runId, this.active.id, context.source);
   }
 }
 
@@ -169,6 +184,7 @@ export function createApprovalExtension(context: {
           runId: context.runId,
           turnId: turn.id,
           source: turn.source,
+          ...(turn.principal ? { principal: turn.principal } : {}),
           cwd: context.cwd,
           toolName: event.toolName,
           input: event.input as unknown as Record<string, unknown>,
@@ -424,7 +440,12 @@ export class AgentRun {
       if (behavior === 'steer') {
         await session.steer(text);
       } else {
-        const cancelQueuedTurn = this.turnApprovals.queue(options.source ?? 'web');
+        const cancelQueuedTurn = this.turnApprovals.queue({
+          source: options.source ?? 'web',
+          ...(options.source === 'feishu' && options.principal
+            ? { principal: options.principal }
+            : {}),
+        });
         try {
           await session.followUp(text);
         } catch (error) {
@@ -437,7 +458,12 @@ export class AgentRun {
 
     this.lastError = undefined;
     this.statusValue = 'running';
-    this.turnApprovals.start(options.source ?? 'web');
+    this.turnApprovals.start({
+      source: options.source ?? 'web',
+      ...(options.source === 'feishu' && options.principal
+        ? { principal: options.principal }
+        : {}),
+    });
 
     const promise = session
       .prompt(

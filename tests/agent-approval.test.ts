@@ -5,7 +5,10 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { describe, expect, it, vi } from 'vitest';
 
-import { ApprovalManager } from '../src/agent/approval.js';
+import {
+  ApprovalManager,
+  type FeishuApprovalPrincipal,
+} from '../src/agent/approval.js';
 import {
   AgentTurnApprovals,
   createApprovalExtension,
@@ -18,7 +21,11 @@ type ToolCallHandler = (
 
 function installGate(options: {
   approvals: ApprovalManager;
-  turn?: { id: string; source: 'desktop' | 'web' | 'feishu' };
+  turn?: {
+    id: string;
+    source: 'desktop' | 'web' | 'feishu';
+    principal?: FeishuApprovalPrincipal;
+  };
 }): ToolCallHandler {
   let handler: ToolCallHandler | undefined;
   const api = {
@@ -90,6 +97,30 @@ describe('createApprovalExtension', () => {
     await expect(denied).resolves.toEqual({ block: true, reason: '用户拒绝了此操作' });
   });
 
+  it('passes the Feishu principal from the active turn into the approval request', async () => {
+    const approvals = new ApprovalManager({ now: () => 1_000 });
+    const principal = {
+      channelId: 'feishu' as const,
+      conversationId: 'oc_chat_1',
+      senderId: 'ou_owner',
+    };
+    approvals.beginTurn('run-1', 'turn-1', 'feishu');
+    const call = installGate({
+      approvals,
+      turn: { id: 'turn-1', source: 'feishu', principal },
+    });
+
+    const pending = call(event('powershell', { command: 'npm test' }), {});
+
+    expect(approvals.listPending()[0]?.principal).toEqual(principal);
+    approvals.decideFromFeishu({
+      id: approvals.listPending()[0]!.id,
+      actorId: 'ou_owner',
+      decision: 'allow_once',
+    });
+    await expect(pending).resolves.toBeUndefined();
+  });
+
   it('fails closed when there is no active turn', async () => {
     const approvals = new ApprovalManager();
     const call = installGate({ approvals });
@@ -117,11 +148,61 @@ describe('createApprovalExtension', () => {
 });
 
 describe('AgentTurnApprovals', () => {
+  it('does not carry a Feishu turn grant into a queued follow-up', async () => {
+    const approvals = new ApprovalManager({ now: () => 1_000 });
+    const principal = {
+      channelId: 'feishu' as const,
+      conversationId: 'oc_chat_1',
+      senderId: 'ou_owner',
+    };
+    const turns = new AgentTurnApprovals(approvals, 'run-1');
+    turns.start({ source: 'feishu', principal });
+    expect(turns.current()?.principal).toEqual(principal);
+
+    const first = approvals.request({
+      runId: 'run-1',
+      turnId: turns.current()!.id,
+      source: 'feishu',
+      principal,
+      cwd: 'F:\\project',
+      toolName: 'write',
+      input: { path: 'a.ts', content: 'x' },
+    });
+    approvals.decideFromFeishu({
+      id: approvals.listPending()[0]!.id,
+      actorId: 'ou_owner',
+      decision: 'allow_turn',
+    });
+    await expect(first).resolves.toEqual({ allowed: true, scope: 'turn' });
+
+    turns.onTurnStart();
+    turns.queue({ source: 'feishu', principal });
+    turns.onTurnStart();
+    expect(turns.current()?.principal).toEqual(principal);
+    const second = approvals.request({
+      runId: 'run-1',
+      turnId: turns.current()!.id,
+      source: 'feishu',
+      principal,
+      cwd: 'F:\\project',
+      toolName: 'write',
+      input: { path: 'b.ts', content: 'y' },
+    });
+
+    expect(approvals.listPending()).toHaveLength(1);
+    approvals.decideFromFeishu({
+      id: approvals.listPending()[0]!.id,
+      actorId: 'ou_owner',
+      decision: 'deny',
+    });
+    await expect(second).resolves.toEqual({ allowed: false, reason: '用户拒绝了此操作' });
+  });
+
   it('expires a turn grant before a queued follow-up starts', async () => {
     const approvals = new ApprovalManager({ now: () => 1_000 });
     approvals.heartbeat('desktop-1');
     const turns = new AgentTurnApprovals(approvals, 'run-1');
-    turns.start('desktop');
+    turns.start({ source: 'desktop' });
 
     const first = approvals.request({
       runId: 'run-1',
@@ -135,7 +216,7 @@ describe('AgentTurnApprovals', () => {
     await expect(first).resolves.toEqual({ allowed: true, scope: 'turn' });
 
     turns.onTurnStart();
-    turns.queue('desktop');
+    turns.queue({ source: 'desktop' });
     turns.onTurnStart();
     const second = approvals.request({
       runId: 'run-1',
