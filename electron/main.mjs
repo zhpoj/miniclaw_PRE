@@ -1,9 +1,10 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { app, BrowserWindow, dialog, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 
 import { createDevServiceManager } from './dev-services.mjs'
+import { pickDirectory } from './folder-picker.mjs'
 import { classifyNavigation, createWindowOptions } from './window-policy.mjs'
 
 const frontendOrigin = 'http://127.0.0.1:5173'
@@ -46,6 +47,16 @@ const manager = createDevServiceManager({ services })
 let mainWindow
 let quitStarted = false
 let cleanupComplete = false
+
+ipcMain.handle('desktop:select-directory', async (event, defaultPath) => {
+  const window = mainWindow
+  if (!window || event.sender !== window.webContents) return null
+  return pickDirectory({
+    showOpenDialog: dialog.showOpenDialog,
+    owner: window,
+    defaultPath,
+  })
+})
 
 function openExternalIfAllowed(targetUrl) {
   if (classifyNavigation(targetUrl, frontendOrigin) === 'external') {

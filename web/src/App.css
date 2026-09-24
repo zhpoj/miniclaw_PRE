@@ -135,6 +135,27 @@
   color: var(--text);
 }
 
+.field-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.field-row > input {
+  min-width: 0;
+  flex: 1;
+}
+
+.directory-picker-button {
+  flex: none;
+  white-space: nowrap;
+}
+
+.field-error {
+  color: #dc2626;
+  font-size: 12px;
+}
+
 input[type='text'],
 input:not([type]),
 select,

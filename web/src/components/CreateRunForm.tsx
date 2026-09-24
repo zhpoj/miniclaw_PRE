@@ -21,11 +21,30 @@ interface Props {
 /** Form driving `POST /api/agent/runs`. Empty fields fall back to server defaults. */
 export default function CreateRunForm({ busy, defaultCwd, onCreate }: Props) {
   const [cwd, setCwd] = useState('')
+  const [selectingDirectory, setSelectingDirectory] = useState(false)
+  const [directoryError, setDirectoryError] = useState('')
   const [model, setModel] = useState('')
   const [thinkingLevel, setThinkingLevel] = useState('')
   const [tools, setTools] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
   const [persistSession, setPersistSession] = useState(false)
+  const desktopApi = window.miniClawDesktop
+
+  const selectDirectory = async () => {
+    if (!desktopApi) return
+    setSelectingDirectory(true)
+    setDirectoryError('')
+    try {
+      const selected = await desktopApi.selectDirectory(
+        cwd.trim() || defaultCwd,
+      )
+      if (selected) setCwd(selected)
+    } catch {
+      setDirectoryError('无法打开文件夹选择器，请手动输入路径。')
+    } finally {
+      setSelectingDirectory(false)
+    }
+  }
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -54,11 +73,28 @@ export default function CreateRunForm({ busy, defaultCwd, onCreate }: Props) {
 
       <label className="field">
         <span>cwd</span>
-        <input
-          value={cwd}
-          onChange={(event) => setCwd(event.target.value)}
-          placeholder={defaultCwd ?? '留空使用引擎默认工作目录'}
-        />
+        <div className="field-row">
+          <input
+            value={cwd}
+            onChange={(event) => setCwd(event.target.value)}
+            placeholder={defaultCwd ?? '留空使用引擎默认工作目录'}
+          />
+          {desktopApi ? (
+            <button
+              className="btn btn-ghost directory-picker-button"
+              type="button"
+              disabled={selectingDirectory}
+              onClick={selectDirectory}
+            >
+              {selectingDirectory ? '选择中…' : '选择文件夹'}
+            </button>
+          ) : null}
+        </div>
+        {directoryError ? (
+          <span className="field-error" role="alert">
+            {directoryError}
+          </span>
+        ) : null}
       </label>
 
       <label className="field">
