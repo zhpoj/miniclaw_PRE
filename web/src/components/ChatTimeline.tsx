@@ -1,12 +1,22 @@
 import { CheckCircle, CircleNotch, WarningCircle } from '@phosphor-icons/react'
 import { useEffect, useMemo, useRef } from 'react'
 
-import type { AgentEventRecord } from '../lib/api'
+import type {
+  AgentEventRecord,
+  ApprovalDecision,
+  ApprovalRecord,
+} from '../lib/api'
 import { buildConversation } from '../lib/conversation'
+import ApprovalCard from './ApprovalCard'
 
 interface Props {
   events: AgentEventRecord[]
+  approvals: ApprovalRecord[]
   hasRun: boolean
+  onApprovalDecision: (
+    id: string,
+    decision: ApprovalDecision,
+  ) => Promise<ApprovalRecord>
 }
 
 function formatTime(value: string): string {
@@ -16,8 +26,16 @@ function formatTime(value: string): string {
     : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
-export default function ChatTimeline({ events, hasRun }: Props) {
-  const items = useMemo(() => buildConversation(events), [events])
+export default function ChatTimeline({
+  events,
+  approvals,
+  hasRun,
+  onApprovalDecision,
+}: Props) {
+  const items = useMemo(
+    () => buildConversation(events, approvals),
+    [approvals, events],
+  )
   const endRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -63,7 +81,15 @@ export default function ChatTimeline({ events, hasRun }: Props) {
             )
           }
 
-          if (item.kind === 'approval') return null
+          if (item.kind === 'approval') {
+            return (
+              <ApprovalCard
+                key={item.id}
+                approval={item.approval}
+                onDecision={onApprovalDecision}
+              />
+            )
+          }
 
           return (
             <article className={`chat-message ${item.role}`} key={item.id}>

@@ -13,13 +13,18 @@ import RunDetail from './components/RunDetail'
 import SessionSidebar from './components/SessionSidebar'
 import {
   createRun,
+  decideApproval,
   fetchHealth,
   fetchRun,
+  heartbeatApprovalClient,
+  listPendingApprovals,
   listRuns,
   sendPrompt,
   subscribeRun,
   type AgentEventRecord,
   type AgentRunSnapshot,
+  type ApprovalDecision,
+  type ApprovalRecord,
   type EngineHealth,
   type PromptInput,
 } from './lib/api'
@@ -28,6 +33,8 @@ import './App.css'
 
 const MAX_RENDERED_EVENTS = 500
 const META_REFRESH_MS = 2000
+const APPROVAL_HEARTBEAT_MS = 5000
+const APPROVAL_CLIENT_ID = globalThis.crypto.randomUUID()
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -44,6 +51,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selectedRun, setSelectedRun] = useState<AgentRunSnapshot | null>(null)
   const [events, setEvents] = useState<AgentEventRecord[]>([])
+  const [recoveredApprovals, setRecoveredApprovals] = useState<ApprovalRecord[]>([])
   const [titles, setTitles] = useState<Record<string, string>>({})
   const [preferredCwd, setPreferredCwd] = useState('')
   const [networkError, setNetworkError] = useState<string | null>(null)
@@ -76,7 +84,15 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedId) return
+    let active = true
     lastSeqRef.current = -1
+    void listPendingApprovals(selectedId)
+      .then(({ approvals }) => {
+        if (active) setRecoveredApprovals(approvals)
+      })
+      .catch((cause: unknown) => {
+        if (active) setNetworkError(toMessage(cause))
+      })
     const stop = subscribeRun(selectedId, 0, {
       onRun: (run) => {
         setSelectedRun(run)
@@ -89,8 +105,23 @@ export default function App() {
       },
       onError: (cause) => setNetworkError(toMessage(cause)),
     })
-    return () => stop()
+    return () => {
+      active = false
+      stop()
+    }
   }, [selectedId, refreshKey])
+
+  useEffect(() => {
+    if (!window.miniClawDesktop) return
+    const heartbeat = (): void => {
+      void heartbeatApprovalClient(APPROVAL_CLIENT_ID).catch((cause: unknown) => {
+        setNetworkError(toMessage(cause))
+      })
+    }
+    heartbeat()
+    const timer = window.setInterval(heartbeat, APPROVAL_HEARTBEAT_MS)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     const bootstrap = window.setTimeout(() => void refreshMeta(), 0)
@@ -131,6 +162,7 @@ export default function App() {
       setSelectedId(id)
       setSelectedRun(run ?? null)
       setEvents([])
+      setRecoveredApprovals([])
       if (run) setPreferredCwd(run.cwd)
       setError(null)
       setNotice(null)
@@ -154,6 +186,7 @@ export default function App() {
         setSelectedRun(run)
         setPreferredCwd(run.cwd)
         setEvents([])
+        setRecoveredApprovals([])
         setNotice('新会话已准备好')
       } catch (cause) {
         setError(toMessage(cause))
@@ -194,7 +227,15 @@ export default function App() {
           : (previous[selectedId] ?? shortTitle(text)),
       }))
       try {
-        const result = await sendPrompt(selectedId, { text, streamingBehavior })
+        const source = window.miniClawDesktop ? 'desktop' : 'web'
+        if (source === 'desktop') {
+          await heartbeatApprovalClient(APPROVAL_CLIENT_ID)
+        }
+        const result = await sendPrompt(selectedId, {
+          text,
+          streamingBehavior,
+          source,
+        })
         setNotice(result.mode === 'started' ? 'MiniClaw 正在处理' : '消息已排队')
       } catch (cause) {
         setError(toMessage(cause))
@@ -203,6 +244,21 @@ export default function App() {
       }
     },
     [selectedId],
+  )
+
+  const handleApprovalDecision = useCallback(
+    async (id: string, decision: ApprovalDecision): Promise<ApprovalRecord> => {
+      const approval = await decideApproval(id, decision)
+      setRecoveredApprovals((previous) => {
+        const index = previous.findIndex((item) => item.id === approval.id)
+        if (index === -1) return previous
+        const next = [...previous]
+        next[index] = approval
+        return next
+      })
+      return approval
+    },
+    [],
   )
 
   return (
@@ -252,7 +308,12 @@ export default function App() {
         </div>
 
         <main className="conversation-area">
-          <ChatTimeline events={events} hasRun={Boolean(selectedId)} />
+          <ChatTimeline
+            events={events}
+            approvals={recoveredApprovals}
+            hasRun={Boolean(selectedId)}
+            onApprovalDecision={handleApprovalDecision}
+          />
         </main>
 
         <footer className="composer-shell">
