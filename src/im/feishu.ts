@@ -2,6 +2,8 @@ import { createDecipheriv, createHmac, timingSafeEqual } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 import type {
+  CardAction,
+  CardActionHandler,
   ChannelCapabilities,
   IMChannel,
   InboundMessage,
@@ -32,8 +34,13 @@ export interface FeishuConfig {
 }
 
 export interface FeishuEventTransport {
-  start(handler: (event: Record<string, unknown>) => Promise<void>): Promise<void>;
+  start(handlers: FeishuEventHandlers): Promise<void>;
   stop(): Promise<void>;
+}
+
+export interface FeishuEventHandlers {
+  onMessage(event: Record<string, unknown>): Promise<void>;
+  onCardAction(event: Record<string, unknown>): Promise<void>;
 }
 
 export type FeishuEventTransportFactory = (config: FeishuConfig) => FeishuEventTransport;
@@ -92,6 +99,7 @@ export class FeishuChannel implements IMChannel {
 
   private readonly config: FeishuConfig;
   private readonly handlers = new Set<InboundMessageHandler>();
+  private readonly cardActionHandlers = new Set<CardActionHandler>();
   private readonly transportFactory: FeishuEventTransportFactory;
   private token: { value: string; expiresAt: number } | null = null;
   private transport: FeishuEventTransport | null = null;
@@ -111,9 +119,15 @@ export class FeishuChannel implements IMChannel {
     const transport = this.transportFactory(this.config);
     this.transport = transport;
     try {
-      await transport.start(async (event) => {
-        const message = this.toInboundMessage(event);
-        if (message) await this.dispatch(message);
+      await transport.start({
+        onMessage: async (event) => {
+          const message = this.toInboundMessage(event);
+          if (message) await this.dispatch(message);
+        },
+        onCardAction: async (event) => {
+          const action = this.toCardAction(event);
+          if (action) await this.dispatchCardAction(action);
+        },
       });
     } catch (error) {
       this.transport = null;
@@ -133,6 +147,13 @@ export class FeishuChannel implements IMChannel {
     this.handlers.add(handler);
     return () => {
       this.handlers.delete(handler);
+    };
+  }
+
+  onCardAction(handler: CardActionHandler): () => void {
+    this.cardActionHandlers.add(handler);
+    return () => {
+      this.cardActionHandlers.delete(handler);
     };
   }
 
@@ -318,6 +339,35 @@ export class FeishuChannel implements IMChannel {
     }
   }
 
+  private toCardAction(payload: Record<string, unknown>): CardAction | null {
+    const event = isRecord(payload['event']) ? payload['event'] : payload;
+    const actorId = readString(event['open_id']);
+    const action = event['action'];
+    if (!actorId || !isRecord(action) || !isRecord(action['value'])) return null;
+
+    const value = action['value'];
+    const approvalId = readString(value['approvalId']);
+    const decision = readString(value['decision']);
+    if (
+      value['kind'] !== 'miniclaw_approval' ||
+      !approvalId ||
+      (decision !== 'allow_once' && decision !== 'allow_turn' && decision !== 'deny')
+    ) {
+      return null;
+    }
+    return { channelId: this.id, actorId, approvalId, decision };
+  }
+
+  private async dispatchCardAction(action: CardAction): Promise<void> {
+    for (const handler of this.cardActionHandlers) {
+      try {
+        await handler(action);
+      } catch (error) {
+        console.error('[feishu] card action handler failed:', errorMessage(error));
+      }
+    }
+  }
+
   /**
    * AES-256-CBC envelope used by Feishu: key is the base64-decoded Encrypt Key,
    * the IV is its first 16 bytes, padding is PKCS7 and thus stripped manually.
@@ -380,7 +430,7 @@ function createLarkTransport(config: FeishuConfig): FeishuEventTransport {
   let client: Lark.WSClient | null = null;
 
   return {
-    async start(handler) {
+    async start(handlers) {
       const dispatcher = new Lark.EventDispatcher({
         ...(config.encryptKey ? { encryptKey: config.encryptKey } : {}),
       }).register({
@@ -394,7 +444,10 @@ function createLarkTransport(config: FeishuConfig): FeishuEventTransport {
             messageKeys: message ? Object.keys(message) : [],
             messageType: message?.['message_type'],
           });
-          await handler(payload);
+          await handlers.onMessage(payload);
+        },
+        'card.action.trigger': async (event: unknown) => {
+          await handlers.onCardAction(event as unknown as Record<string, unknown>);
         },
       });
       client = new Lark.WSClient({

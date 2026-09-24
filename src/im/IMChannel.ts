@@ -36,6 +36,16 @@ export interface OutboundContent {
 
 export type InboundMessageHandler = (message: InboundMessage) => void | Promise<void>;
 
+/** A validated action emitted by an interactive approval card. */
+export interface CardAction {
+  readonly channelId: string;
+  readonly actorId: string;
+  readonly approvalId: string;
+  readonly decision: 'allow_once' | 'allow_turn' | 'deny';
+}
+
+export type CardActionHandler = (action: CardAction) => void | Promise<void>;
+
 export interface IMChannel {
   readonly id: string;
   readonly capabilities: ChannelCapabilities;
@@ -51,6 +61,8 @@ export interface IMChannel {
 
   /** Subscribe to inbound messages; the returned function unsubscribes. */
   onMessage(handler: InboundMessageHandler): () => void;
+  /** Subscribe to validated interactive-card actions when the channel supports them. */
+  onCardAction?(handler: CardActionHandler): () => void;
 }
 
 /** Result an adapter produces for an inbound webhook call, rendered by the HTTP layer. */

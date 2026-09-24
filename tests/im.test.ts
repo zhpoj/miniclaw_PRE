@@ -120,8 +120,8 @@ describe('FeishuChannel long connection', () => {
         connectionMode: 'websocket',
       },
       () => ({
-        start(handler) {
-          receive = handler;
+        start(handlers) {
+          receive = handlers.onMessage;
           return Promise.resolve();
         },
         stop() {
@@ -141,6 +141,59 @@ describe('FeishuChannel long connection', () => {
 
     expect(received).toEqual(['hello agent']);
     expect(stopped).toBe(true);
+  });
+
+  it('normalizes only well-formed MiniClaw approval card actions', async () => {
+    let receiveCardAction:
+      | ((event: Record<string, unknown>) => Promise<void>)
+      | undefined;
+    const channel = new FeishuChannel(
+      { appId: 'cli_1', appSecret: 'secret_1', connectionMode: 'websocket' },
+      () => ({
+        start(handlers) {
+          receiveCardAction = handlers.onCardAction;
+          return Promise.resolve();
+        },
+        stop() {
+          return Promise.resolve();
+        },
+      }),
+    );
+    const received: unknown[] = [];
+    channel.onCardAction((action) => {
+      received.push(action);
+    });
+
+    await channel.start();
+    await receiveCardAction?.({
+      open_id: 'ou_owner',
+      open_message_id: 'om_card_1',
+      action: {
+        value: {
+          kind: 'miniclaw_approval',
+          approvalId: 'approval-1',
+          decision: 'allow_once',
+        },
+      },
+    });
+    await receiveCardAction?.({ action: { value: { kind: 'miniclaw_approval', approvalId: 'a', decision: 'deny' } } });
+    await receiveCardAction?.({
+      open_id: 'ou_owner',
+      action: { value: { kind: 'other', approvalId: 'a', decision: 'deny' } },
+    });
+    await receiveCardAction?.({
+      open_id: 'ou_owner',
+      action: { value: { kind: 'miniclaw_approval', approvalId: 'a', decision: 'delete_everything' } },
+    });
+
+    expect(received).toEqual([
+      {
+        channelId: 'feishu',
+        actorId: 'ou_owner',
+        approvalId: 'approval-1',
+        decision: 'allow_once',
+      },
+    ]);
   });
 
   it('does not create a long connection in webhook mode', async () => {
