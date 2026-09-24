@@ -3,6 +3,7 @@ import { streamSSE } from 'hono/streaming';
 import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { z } from 'zod';
 
+import { ApprovalError } from './agent/approval.js';
 import { AgentEngine, createEngineFromEnv, ENGINE_NAME } from './agent/engine.js';
 import { AgentEngineError } from './agent/run.js';
 import { mountIMChannels } from './im/index.js';
@@ -21,6 +22,15 @@ const createRunSchema = z.object({
 const promptSchema = z.object({
   text: z.string().min(1),
   streamingBehavior: z.enum(['steer', 'followUp']).optional(),
+  source: z.enum(['desktop', 'web', 'feishu']).default('web'),
+});
+
+const decisionSchema = z.object({
+  decision: z.enum(['allow_once', 'allow_turn', 'deny']),
+});
+
+const heartbeatSchema = z.object({
+  clientId: z.string().min(1).max(128),
 });
 
 const sinceSchema = z.coerce.number().int().min(0).default(0);
@@ -44,6 +54,60 @@ export function createApp(options: CreateAppOptions = {}) {
       status: 'ok',
       engine: engine.describe(),
     });
+  });
+
+  app.post('/api/agent/approval-clients/heartbeat', async (context) => {
+    const body = await context.req.json().catch(() => undefined);
+    const parsed = heartbeatSchema.safeParse(body);
+    if (!parsed.success) {
+      return context.json(
+        {
+          error: 'invalid_request',
+          message: 'Invalid approval client payload.',
+          issues: z.treeifyError(parsed.error),
+        },
+        400,
+      );
+    }
+    engine.getApprovalManager().heartbeat(parsed.data.clientId);
+    return context.json({ active: true });
+  });
+
+  app.get('/api/agent/approvals', (context) => {
+    const status = context.req.query('status');
+    if (status !== undefined && status !== 'pending') {
+      return context.json(
+        { error: 'invalid_request', message: 'Only pending approvals can be listed.' },
+        400,
+      );
+    }
+    const runId = context.req.query('runId');
+    return context.json({
+      approvals: engine.getApprovalManager().listPending(runId || undefined),
+    });
+  });
+
+  app.post('/api/agent/approvals/:id/decision', async (context) => {
+    const body = await context.req.json().catch(() => undefined);
+    const parsed = decisionSchema.safeParse(body);
+    if (!parsed.success) {
+      return context.json(
+        {
+          error: 'invalid_request',
+          message: 'Invalid approval decision.',
+          issues: z.treeifyError(parsed.error),
+        },
+        400,
+      );
+    }
+    try {
+      const approval = engine
+        .getApprovalManager()
+        .decide(context.req.param('id'), parsed.data.decision);
+      return context.json(approval);
+    } catch (error) {
+      return errorResponse(context, error);
+    }
   });
 
   app.post('/api/agent/runs', async (context) => {
@@ -158,6 +222,7 @@ export function createApp(options: CreateAppOptions = {}) {
         ...(parsed.data.streamingBehavior
           ? { streamingBehavior: parsed.data.streamingBehavior }
           : {}),
+        source: parsed.data.source,
       });
       return context.json({ id: run.id, ...result }, 202);
     } catch (error) {
@@ -195,6 +260,12 @@ function errorResponse(
   error: unknown,
 ): Response {
   if (error instanceof AgentEngineError) {
+    return context.json(
+      { error: error.code, message: error.message },
+      error.status as ContentfulStatusCode,
+    );
+  }
+  if (error instanceof ApprovalError) {
     return context.json(
       { error: error.code, message: error.message },
       error.status as ContentfulStatusCode,
