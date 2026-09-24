@@ -16,6 +16,12 @@ const baseRequest: ApprovalRequestInput = {
   input: { path: 'src/a.ts', content: 'hello' },
 };
 
+const feishuPrincipal = {
+  channelId: 'feishu' as const,
+  conversationId: 'oc_chat_1',
+  senderId: 'ou_owner',
+};
+
 function readyManager(now = () => 1_000): ApprovalManager {
   const manager = new ApprovalManager({ now, timeoutMs: 30_000, clientTtlMs: 10_000 });
   manager.heartbeat('desktop-1');
@@ -78,13 +84,67 @@ describe('ApprovalManager', () => {
     manager.endTurn('run-1', 'test cleanup');
   });
 
-  it('fails closed when no desktop approval client is active', async () => {
+  it('allows only the original Feishu sender to approve a pending operation', async () => {
+    const manager = new ApprovalManager({ now: () => 1_000 });
+    manager.beginTurn('run-1', 'turn-1', 'feishu');
+    const outcome = manager.request({
+      ...baseRequest,
+      source: 'feishu',
+      principal: feishuPrincipal,
+    });
+    const [record] = manager.listPending();
+
+    expect(record?.principal).toEqual(feishuPrincipal);
+    expect(() => manager.decideFromFeishu({
+      id: record!.id,
+      actorId: 'ou_other',
+      decision: 'allow_once',
+    })).toThrow(/not authorized/i);
+    manager.decideFromFeishu({
+      id: record!.id,
+      actorId: 'ou_owner',
+      decision: 'allow_once',
+    });
+
+    await expect(outcome).resolves.toEqual({ allowed: true, scope: 'once' });
+  });
+
+  it('rejects a second Feishu callback after the approval is resolved', async () => {
+    const manager = new ApprovalManager({ now: () => 1_000 });
+    manager.beginTurn('run-1', 'turn-1', 'feishu');
+    const outcome = manager.request({
+      ...baseRequest,
+      source: 'feishu',
+      principal: feishuPrincipal,
+    });
+    const [record] = manager.listPending();
+
+    manager.decideFromFeishu({
+      id: record!.id,
+      actorId: 'ou_owner',
+      decision: 'allow_once',
+    });
+
+    expect(() => manager.decideFromFeishu({
+      id: record!.id,
+      actorId: 'ou_owner',
+      decision: 'allow_once',
+    })).toThrowError(
+      expect.objectContaining<Partial<ApprovalError>>({
+        code: 'approval_not_pending',
+        status: 409,
+      }),
+    );
+    await expect(outcome).resolves.toEqual({ allowed: true, scope: 'once' });
+  });
+
+  it('fails closed when a Feishu request has no original sender identity', async () => {
     const manager = new ApprovalManager({ now: () => 1_000 });
     manager.beginTurn('run-1', 'turn-1', 'feishu');
 
     await expect(manager.request({ ...baseRequest, source: 'feishu' })).resolves.toEqual({
       allowed: false,
-      reason: '需要在桌面客户端确认此操作',
+      reason: '远程审批缺少发起人身份',
     });
     expect(manager.listPending()).toEqual([]);
   });

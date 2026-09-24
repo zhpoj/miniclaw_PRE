@@ -10,12 +10,19 @@ export type ApprovalStatus =
   | 'cancelled';
 export type DangerousToolName = 'edit' | 'write' | 'powershell';
 
+export interface FeishuApprovalPrincipal {
+  readonly channelId: 'feishu';
+  readonly conversationId: string;
+  readonly senderId: string;
+}
+
 export interface ApprovalRecord {
   id: string;
   runId: string;
   turnId: string;
   toolName: DangerousToolName;
   source: PromptSource;
+  principal?: FeishuApprovalPrincipal;
   cwd: string;
   summary: string;
   details: Record<string, unknown>;
@@ -28,6 +35,7 @@ export interface ApprovalRequestInput {
   runId: string;
   turnId: string;
   source: PromptSource;
+  principal?: FeishuApprovalPrincipal;
   cwd: string;
   toolName: string;
   input: Record<string, unknown>;
@@ -44,9 +52,12 @@ export type ApprovalEvent = {
 
 export class ApprovalError extends Error {
   constructor(
-    readonly code: 'approval_not_found' | 'approval_not_pending',
+    readonly code:
+      | 'approval_not_found'
+      | 'approval_not_pending'
+      | 'approval_not_authorized',
     message: string,
-    readonly status: 404 | 409,
+    readonly status: 403 | 404 | 409,
   ) {
     super(message);
     this.name = 'ApprovalError';
@@ -145,7 +156,23 @@ export function summarizeToolCall(
 }
 
 function cloneRecord(record: ApprovalRecord): ApprovalRecord {
-  return { ...record, details: { ...record.details } };
+  return {
+    ...record,
+    ...(record.principal ? { principal: { ...record.principal } } : {}),
+    details: { ...record.details },
+  };
+}
+
+function isFeishuPrincipal(value: unknown): value is FeishuApprovalPrincipal {
+  if (!value || typeof value !== 'object') return false;
+  const principal = value as Record<string, unknown>;
+  return (
+    principal['channelId'] === 'feishu' &&
+    typeof principal['conversationId'] === 'string' &&
+    principal['conversationId'].trim().length > 0 &&
+    typeof principal['senderId'] === 'string' &&
+    principal['senderId'].trim().length > 0
+  );
 }
 
 export class ApprovalManager {
@@ -204,11 +231,19 @@ export class ApprovalManager {
       return Promise.resolve({ allowed: false, reason: '当前任务已经结束' });
     }
 
+    const principal =
+      input.source === 'feishu' && isFeishuPrincipal(input.principal)
+        ? input.principal
+        : undefined;
+    if (input.source === 'feishu' && !principal) {
+      return Promise.resolve({ allowed: false, reason: '远程审批缺少发起人身份' });
+    }
+
     const key = turnKey(input.runId, input.turnId);
     if (this.turnGrants.has(key)) {
       return Promise.resolve({ allowed: true, scope: 'turn' });
     }
-    if (!this.hasActiveClient()) {
+    if (input.source !== 'feishu' && !this.hasActiveClient()) {
       return Promise.resolve({ allowed: false, reason: '需要在桌面客户端确认此操作' });
     }
 
@@ -221,6 +256,7 @@ export class ApprovalManager {
       turnId: input.turnId,
       toolName,
       source: input.source,
+      ...(principal ? { principal: { ...principal } } : {}),
       cwd: redactText(input.cwd),
       summary: description.summary,
       details: description.details,
@@ -271,6 +307,29 @@ export class ApprovalManager {
     }
 
     return cloneRecord(this.records.get(id)!);
+  }
+
+  decideFromFeishu(input: {
+    id: string;
+    actorId: string;
+    decision: ApprovalDecision;
+  }): ApprovalRecord {
+    const known = this.records.get(input.id);
+    if (!known) {
+      throw new ApprovalError('approval_not_found', 'Unknown approval request.', 404);
+    }
+    if (
+      known.source !== 'feishu' ||
+      !known.principal ||
+      known.principal.senderId !== input.actorId
+    ) {
+      throw new ApprovalError(
+        'approval_not_authorized',
+        'Actor is not authorized to decide this approval.',
+        403,
+      );
+    }
+    return this.decide(input.id, input.decision);
   }
 
   listPending(runId?: string): ApprovalRecord[] {
