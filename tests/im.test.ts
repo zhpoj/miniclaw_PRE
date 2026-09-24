@@ -176,6 +176,18 @@ describe('FeishuChannel long connection', () => {
         },
       },
     });
+    await receiveCardAction?.({
+      event: {
+        operator: { open_id: 'ou_owner_2' },
+        action: {
+          value: {
+            kind: 'miniclaw_approval',
+            approvalId: 'approval-2',
+            decision: 'deny',
+          },
+        },
+      },
+    });
     await receiveCardAction?.({ action: { value: { kind: 'miniclaw_approval', approvalId: 'a', decision: 'deny' } } });
     await receiveCardAction?.({
       open_id: 'ou_owner',
@@ -192,6 +204,12 @@ describe('FeishuChannel long connection', () => {
         actorId: 'ou_owner',
         approvalId: 'approval-1',
         decision: 'allow_once',
+      },
+      {
+        channelId: 'feishu',
+        actorId: 'ou_owner_2',
+        approvalId: 'approval-2',
+        decision: 'deny',
       },
     ]);
   });

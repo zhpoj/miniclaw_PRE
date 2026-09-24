@@ -341,7 +341,8 @@ export class FeishuChannel implements IMChannel {
 
   private toCardAction(payload: Record<string, unknown>): CardAction | null {
     const event = isRecord(payload['event']) ? payload['event'] : payload;
-    const actorId = readString(event['open_id']);
+    const operator = isRecord(event['operator']) ? event['operator'] : undefined;
+    const actorId = readString(event['open_id']) ?? readString(operator?.['open_id']);
     const action = event['action'];
     if (!actorId || !isRecord(action) || !isRecord(action['value'])) return null;
 
