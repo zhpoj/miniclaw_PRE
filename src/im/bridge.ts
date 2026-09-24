@@ -450,6 +450,22 @@ export class IMBridge {
         });
         return;
       }
+      case 'remember': {
+        const content = rest.join(' ').trim();
+        if (!content) {
+          await this.trySend(channel, binding.conversationId, { text: '请提供要保存的记忆内容。' });
+          return;
+        }
+        this.store?.insertMemory({ scope: 'conversation', scopeId: binding.conversationId, content, source: 'feishu' });
+        await this.trySend(channel, binding.conversationId, { text: '已保存到当前会话记忆。' });
+        return;
+      }
+      case 'memories': {
+        const query = rest.join(' ').trim();
+        const rows = this.store?.searchMemories('conversation', binding.conversationId, query) ?? [];
+        await this.trySend(channel, binding.conversationId, { text: rows.length === 0 ? '当前会话没有匹配记忆。' : rows.map((row) => `- ${row.content}`).join('\n') });
+        return;
+      }
       default:
         await this.trySend(channel, binding.conversationId, {
           text: `未知命令 /${name}。\n\n${HELP_TEXT}`,

@@ -9,8 +9,9 @@ import type {
 } from './reliability.js';
 import type { UsageLedgerEntry, UsageLedgerFilter, UsageLedgerRow } from './usage.js';
 import type { ScheduledTask, TaskRun, TaskRunResult } from '../scheduler/task-store.js';
+import type { MemoryInput, MemoryRecord, MemoryScope } from '../memory/memory-store.js';
 
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 
 export interface StoredMessageInput {
   channelId: string;
@@ -359,6 +360,27 @@ export class SqliteStore {
     return row.next_run_at ?? undefined;
   }
 
+  insertMemory(input: MemoryInput): string {
+    const id = randomUUID(); const now = new Date().toISOString();
+    this.db.prepare(`INSERT INTO memories(id, scope, scope_id, content, source, importance, access_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(id, input.scope, input.scopeId, input.content, input.source, input.importance ?? 0.5, now, now);
+    return id;
+  }
+
+  searchMemories(scope: MemoryScope, scopeId: string, query: string): MemoryRecord[] {
+    const rows = this.db.prepare(`SELECT id, scope, scope_id, content, source, importance, access_count, deleted_at, created_at, updated_at
+      FROM memories WHERE scope = ? AND scope_id = ? AND deleted_at IS NULL AND content LIKE ? ORDER BY importance DESC, updated_at DESC`).all(scope, scopeId, `%${query}%`) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.readMemory(row));
+  }
+
+  touchMemory(id: string): void {
+    this.db.prepare('UPDATE memories SET access_count = access_count + 1, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(new Date().toISOString(), id);
+  }
+
+  softDeleteMemory(id: string): void {
+    this.db.prepare('UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(new Date().toISOString(), new Date().toISOString(), id);
+  }
+
   private readReliability(id: string): ReliabilityQueueItem | undefined {
     const row = this.db.prepare(`
       SELECT id, channel_id, conversation_id, idempotency_key, payload_json,
@@ -390,6 +412,16 @@ export class SqliteStore {
       id: String(row['id']), name: String(row['name']), schedule: String(row['schedule']),
       conversationId: String(row['conversation_id']), payload: JSON.parse(String(row['payload_json'])) as Record<string, unknown>,
       enabled: Number(row['enabled']) === 1, nextRunAt: String(row['next_run_at']),
+      createdAt: String(row['created_at']), updatedAt: String(row['updated_at']),
+    };
+  }
+
+  private readMemory(row: Record<string, unknown>): MemoryRecord {
+    return {
+      id: String(row['id']), scope: String(row['scope']) as MemoryScope, scopeId: String(row['scope_id']),
+      content: String(row['content']), source: String(row['source']), importance: Number(row['importance']),
+      accessCount: Number(row['access_count']),
+      ...(row['deleted_at'] === null ? {} : { deletedAt: String(row['deleted_at']) }),
       createdAt: String(row['created_at']), updatedAt: String(row['updated_at']),
     };
   }
@@ -511,6 +543,19 @@ export class SqliteStore {
       );
       CREATE INDEX IF NOT EXISTS idx_task_runs_active
         ON task_runs(task_id, status);
+      CREATE TABLE IF NOT EXISTS memories (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL CHECK(scope IN ('global', 'workspace', 'conversation')),
+        scope_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source TEXT NOT NULL,
+        importance REAL NOT NULL DEFAULT 0.5,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        deleted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_memories_scope_updated ON memories(scope, scope_id, updated_at);
     `);
     if (version < 2) {
       const columns = this.db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;
