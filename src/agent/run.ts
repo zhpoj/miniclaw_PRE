@@ -6,11 +6,18 @@ import {
   createAgentSession,
   type CreateAgentSessionOptions,
   DefaultResourceLoader,
+  type ExtensionFactory,
   getAgentDir,
+  type InlineExtension,
   type ModelRuntime,
   resolveCliModel,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
+
+import {
+  ApprovalManager,
+  type PromptSource,
+} from './approval.js';
 
 /** Thinking levels accepted by the pi runtime. */
 export type AgentThinkingLevel = NonNullable<
@@ -76,6 +83,50 @@ export interface PromptResult {
   mode: 'started' | 'queued';
 }
 
+export interface PromptOptions {
+  streamingBehavior?: 'steer' | 'followUp';
+  source?: PromptSource;
+}
+
+interface ActiveTurn {
+  id: string;
+  source: PromptSource;
+}
+
+const APPROVAL_TOOLS = new Set(['edit', 'write', 'powershell']);
+
+export function createApprovalExtension(context: {
+  approvals: ApprovalManager;
+  runId: string;
+  cwd: string;
+  getTurn: () => ActiveTurn | undefined;
+}): ExtensionFactory {
+  return (pi) => {
+    pi.on('tool_call', async (event) => {
+      if (!APPROVAL_TOOLS.has(event.toolName)) return undefined;
+      const turn = context.getTurn();
+      if (!turn) {
+        return { block: true, reason: '当前没有可授权的任务' };
+      }
+      try {
+        const outcome = await context.approvals.request({
+          runId: context.runId,
+          turnId: turn.id,
+          source: turn.source,
+          cwd: context.cwd,
+          toolName: event.toolName,
+          input: event.input as unknown as Record<string, unknown>,
+        });
+        return outcome.allowed
+          ? undefined
+          : { block: true, reason: outcome.reason };
+      } catch {
+        return { block: true, reason: '操作审批服务异常，已阻止执行' };
+      }
+    });
+  };
+}
+
 /** Maximum number of events kept in memory per run (ring buffer). */
 const MAX_EVENTS = 2000;
 
@@ -116,29 +167,42 @@ export class AgentRun {
   readonly request: AgentRunRequest;
 
   private readonly tools: string[];
+  private readonly approvals: ApprovalManager;
   private session: AgentSession | undefined;
   private unsubscribe: (() => void) | undefined;
+  private unsubscribeApprovals: (() => void) | undefined;
   private readonly events: AgentEventRecord[] = [];
   private readonly listeners = new Set<(event: AgentEventRecord) => void>();
   private activeRun: Promise<void> | undefined;
   private seq = 0;
   private statusValue: AgentRunStatus = 'starting';
   private lastError: string | undefined;
+  private activeTurn: ActiveTurn | undefined;
 
-  private constructor(request: AgentRunRequest, defaults: AgentRunDefaults) {
+  private constructor(
+    request: AgentRunRequest,
+    defaults: AgentRunDefaults,
+    approvals: ApprovalManager,
+  ) {
     this.id = randomUUID();
     this.createdAt = new Date().toISOString();
     this.cwd = request.cwd ?? defaults.cwd;
     this.request = request;
     this.tools = request.tools ?? defaults.tools;
+    this.approvals = approvals;
+    this.unsubscribeApprovals = approvals.subscribe((event) => {
+      if (event.approval.runId !== this.id) return;
+      this.recordEvent(event.type, { approval: event.approval });
+    });
   }
 
   static async create(
     modelRuntime: ModelRuntime,
     request: AgentRunRequest,
     defaults: AgentRunDefaults,
+    approvals: ApprovalManager,
   ): Promise<AgentRun> {
-    const run = new AgentRun(request, defaults);
+    const run = new AgentRun(request, defaults, approvals);
     await run.initialize(modelRuntime, defaults);
     return run;
   }
@@ -174,15 +238,26 @@ export class AgentRun {
       if (resolved.thinkingLevel) options.thinkingLevel = resolved.thinkingLevel;
     }
 
-    if (this.request.systemPrompt) {
-      const loader = new DefaultResourceLoader({
+    const approvalExtension: InlineExtension = {
+      name: 'miniclaw-operation-approval',
+      hidden: true,
+      factory: createApprovalExtension({
+        approvals: this.approvals,
+        runId: this.id,
         cwd: this.cwd,
-        agentDir: defaults.agentDir ?? getAgentDir(),
-        systemPromptOverride: () => this.request.systemPrompt ?? '',
-      });
-      await loader.reload();
-      options.resourceLoader = loader;
-    }
+        getTurn: () => this.activeTurn,
+      }),
+    };
+    const loader = new DefaultResourceLoader({
+      cwd: this.cwd,
+      agentDir: defaults.agentDir ?? getAgentDir(),
+      ...(this.request.systemPrompt
+        ? { systemPromptOverride: () => this.request.systemPrompt ?? '' }
+        : {}),
+      extensionFactories: [approvalExtension],
+    });
+    await loader.reload();
+    options.resourceLoader = loader;
 
     const { session } = await createAgentSession(options);
     this.session = session;
@@ -191,22 +266,27 @@ export class AgentRun {
   }
 
   private handleEvent(event: AgentSessionEvent): void {
-    const record: AgentEventRecord = {
-      seq: this.seq++,
-      at: new Date().toISOString(),
-      type: event.type,
-      payload: serializePayload(event),
-    };
-
-    this.events.push(record);
-    if (this.events.length > MAX_EVENTS) {
-      this.events.splice(0, this.events.length - MAX_EVENTS);
-    }
+    this.recordEvent(event.type, serializePayload(event));
 
     if (event.type === 'agent_start') {
       this.statusValue = 'running';
     } else if (event.type === 'agent_settled' && this.statusValue !== 'closed') {
       this.statusValue = 'idle';
+      this.endActiveTurn('当前任务已结束');
+    }
+  }
+
+  private recordEvent(type: string, payload: unknown): void {
+    const record: AgentEventRecord = {
+      seq: this.seq++,
+      at: new Date().toISOString(),
+      type,
+      payload,
+    };
+
+    this.events.push(record);
+    if (this.events.length > MAX_EVENTS) {
+      this.events.splice(0, this.events.length - MAX_EVENTS);
     }
 
     for (const listener of this.listeners) {
@@ -264,7 +344,7 @@ export class AgentRun {
    */
   async prompt(
     text: string,
-    options: { streamingBehavior?: 'steer' | 'followUp' } = {},
+    options: PromptOptions = {},
   ): Promise<PromptResult> {
     const session = this.requireSession();
 
@@ -287,6 +367,11 @@ export class AgentRun {
 
     this.lastError = undefined;
     this.statusValue = 'running';
+    this.activeTurn = {
+      id: randomUUID(),
+      source: options.source ?? 'web',
+    };
+    this.approvals.beginTurn(this.id, this.activeTurn.id, this.activeTurn.source);
 
     const promise = session
       .prompt(
@@ -301,8 +386,10 @@ export class AgentRun {
       .catch((error: unknown) => {
         this.lastError = describeError(error);
         if (this.statusValue !== 'closed') this.statusValue = 'error';
+        this.endActiveTurn('任务执行失败');
       })
       .finally(() => {
+        this.endActiveTurn('当前任务已结束');
         this.activeRun = undefined;
       });
 
@@ -319,6 +406,7 @@ export class AgentRun {
   async abort(): Promise<void> {
     const session = this.session;
     if (!session) return;
+    this.endActiveTurn('任务已中止');
     await session.abort();
     if (this.statusValue !== 'closed') this.statusValue = 'idle';
   }
@@ -326,10 +414,13 @@ export class AgentRun {
   /** Release the underlying pi session. */
   close(): void {
     if (this.statusValue === 'closed') return;
+    this.endActiveTurn('会话已关闭');
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     this.session?.dispose();
     this.session = undefined;
+    this.unsubscribeApprovals?.();
+    this.unsubscribeApprovals = undefined;
     this.listeners.clear();
     this.statusValue = 'closed';
   }
@@ -343,5 +434,11 @@ export class AgentRun {
       );
     }
     return this.session;
+  }
+
+  private endActiveTurn(reason: string): void {
+    if (!this.activeTurn) return;
+    this.activeTurn = undefined;
+    this.approvals.endTurn(this.id, reason);
   }
 }

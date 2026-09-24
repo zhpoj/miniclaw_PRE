@@ -1,5 +1,6 @@
 import { ModelRuntime, VERSION } from '@earendil-works/pi-coding-agent';
 
+import { ApprovalManager } from './approval.js';
 import {
   AgentEngineError,
   AgentRun,
@@ -30,6 +31,8 @@ export interface AgentEngineOptions {
   persistSessions?: boolean;
   /** Allow the model runtime to refresh catalogs over the network. */
   allowModelNetwork?: boolean;
+  /** Approval state shared by all runs. Primarily injectable for tests. */
+  approvals?: ApprovalManager;
 }
 
 export interface AgentEngineInfo {
@@ -73,9 +76,11 @@ export class AgentEngine {
   private readonly defaults: AgentRunDefaults;
   private readonly workspace: WorkspaceConfig;
   private readonly allowModelNetwork: boolean;
+  private readonly approvals: ApprovalManager;
   private runtimePromise: Promise<ModelRuntime> | undefined;
 
   constructor(options: AgentEngineOptions = {}) {
+    this.approvals = options.approvals ?? new ApprovalManager();
     this.workspace = options.workspace ?? resolveWorkspace();
     this.defaults = {
       cwd: options.cwd ?? this.workspace.activePath,
@@ -103,13 +108,22 @@ export class AgentEngine {
     return { ...this.defaults };
   }
 
+  getApprovalManager(): ApprovalManager {
+    return this.approvals;
+  }
+
   async createRun(request: AgentRunRequest = {}): Promise<AgentRun> {
     const modelRuntime = await this.getModelRuntime();
     const resolved: AgentRunRequest =
       request.cwd === undefined
         ? request
         : { ...request, cwd: mapWorkspacePath(request.cwd, this.workspace) };
-    const run = await AgentRun.create(modelRuntime, resolved, this.defaults);
+    const run = await AgentRun.create(
+      modelRuntime,
+      resolved,
+      this.defaults,
+      this.approvals,
+    );
     this.runs.set(run.id, run);
     return run;
   }
