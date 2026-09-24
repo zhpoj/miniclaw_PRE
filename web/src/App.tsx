@@ -1,10 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import {
+  ArrowClockwise,
+  FolderOpen,
+  ListBullets,
+  X,
+} from '@phosphor-icons/react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import CreateRunForm from './components/CreateRunForm'
+import ChatTimeline from './components/ChatTimeline'
 import EventFeed from './components/EventFeed'
 import PromptComposer from './components/PromptComposer'
 import RunDetail from './components/RunDetail'
-import RunList from './components/RunList'
+import SessionSidebar from './components/SessionSidebar'
 import {
   createRun,
   fetchHealth,
@@ -14,19 +20,22 @@ import {
   subscribeRun,
   type AgentEventRecord,
   type AgentRunSnapshot,
-  type CreateRunInput,
   type EngineHealth,
   type PromptInput,
 } from './lib/api'
+import { buildConversation } from './lib/conversation'
 import './App.css'
 
-/** How many events we keep in the DOM before dropping the oldest. */
 const MAX_RENDERED_EVENTS = 500
-/** Low-frequency refresh for run status / sidebar list (events use SSE instead). */
 const META_REFRESH_MS = 2000
 
 function toMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function shortTitle(text: string): string {
+  const normalized = text.replace(/\s+/g, ' ').trim()
+  return normalized.length > 22 ? `${normalized.slice(0, 22)}…` : normalized
 }
 
 export default function App() {
@@ -35,22 +44,28 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [selectedRun, setSelectedRun] = useState<AgentRunSnapshot | null>(null)
   const [events, setEvents] = useState<AgentEventRecord[]>([])
-  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [titles, setTitles] = useState<Record<string, string>>({})
+  const [preferredCwd, setPreferredCwd] = useState('')
   const [networkError, setNetworkError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
-  const cursorRef = useRef(0)
   const lastSeqRef = useRef(-1)
 
-  /** Low-frequency metadata refresh: sidebar list + selected run status card. */
+  const currentFolder =
+    selectedRun?.cwd || preferredCwd || health?.engine.cwd || '正在连接项目…'
+
   const refreshMeta = useCallback(async (): Promise<void> => {
     try {
       const listed = await listRuns()
       setRuns(listed.runs)
       setNetworkError(null)
-      if (selectedId) {
+      if (!selectedId && listed.runs[0]) {
+        setSelectedId(listed.runs[0].id)
+        setPreferredCwd(listed.runs[0].cwd)
+      } else if (selectedId) {
         const run = await fetchRun(selectedId)
         setSelectedRun(run)
       }
@@ -59,88 +74,128 @@ export default function App() {
     }
   }, [selectedId])
 
-  // SSE event stream for the selected run (real-time "streaming" output).
   useEffect(() => {
     if (!selectedId) return
-    cursorRef.current = 0
     lastSeqRef.current = -1
     const stop = subscribeRun(selectedId, 0, {
-      onRun: (run) => setSelectedRun(run),
+      onRun: (run) => {
+        setSelectedRun(run)
+        setPreferredCwd(run.cwd)
+      },
       onEvent: (event) => {
         if (event.seq <= lastSeqRef.current) return
         lastSeqRef.current = event.seq
-        cursorRef.current = event.seq + 1
-        setEvents((prev) => [...prev, event].slice(-MAX_RENDERED_EVENTS))
+        setEvents((previous) => [...previous, event].slice(-MAX_RENDERED_EVENTS))
       },
       onError: (cause) => setNetworkError(toMessage(cause)),
     })
     return () => stop()
   }, [selectedId, refreshKey])
 
-  // Metadata refresh loop (status card + sidebar). Independent of the SSE stream.
   useEffect(() => {
-    const bootstrap = window.setTimeout(() => {
-      void refreshMeta()
-    }, 0)
-    if (!autoRefresh) {
-      return () => {
-        window.clearTimeout(bootstrap)
-      }
-    }
-    const timer = window.setInterval(() => {
-      void refreshMeta()
-    }, META_REFRESH_MS)
+    const bootstrap = window.setTimeout(() => void refreshMeta(), 0)
+    const timer = window.setInterval(() => void refreshMeta(), META_REFRESH_MS)
     return () => {
       window.clearTimeout(bootstrap)
       window.clearInterval(timer)
     }
-  }, [refreshMeta, autoRefresh, refreshKey])
+  }, [refreshMeta, refreshKey])
 
   useEffect(() => {
     void fetchHealth()
-      .then(setHealth)
+      .then((result) => {
+        setHealth(result)
+        setPreferredCwd((current) => current || result.engine.cwd)
+      })
       .catch((cause: unknown) => setNetworkError(toMessage(cause)))
   }, [])
 
-  const selectRun = useCallback((id: string): void => {
-    setSelectedId(id)
-    setSelectedRun(null)
-    setEvents([])
-    setNotice(`已切换到 run ${id}`)
-  }, [])
+  const conversation = useMemo(() => buildConversation(events), [events])
+  const sidebarTitles = useMemo(() => {
+    if (!selectedId || titles[selectedId]) return titles
+    const firstUserMessage = conversation.find(
+      (item) => item.kind === 'message' && item.role === 'user',
+    )
+    if (firstUserMessage?.kind === 'message') {
+      return {
+        ...titles,
+        [selectedId]: shortTitle(firstUserMessage.text),
+      }
+    }
+    return titles
+  }, [conversation, selectedId, titles])
 
-  const handleCreate = useCallback(
-    async (input: CreateRunInput): Promise<void> => {
+  const selectRun = useCallback(
+    (id: string): void => {
+      const run = runs.find((item) => item.id === id)
+      setSelectedId(id)
+      setSelectedRun(run ?? null)
+      setEvents([])
+      if (run) setPreferredCwd(run.cwd)
+      setError(null)
+      setNotice(null)
+    },
+    [runs],
+  )
+
+  const createConversation = useCallback(
+    async (cwd?: string): Promise<void> => {
       setBusy(true)
       setError(null)
       setNotice(null)
       try {
-        const run = await createRun(input)
-        setRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)])
-        selectRun(run.id)
-        setNotice(`run 已创建：${run.id}`)
+        const run = await createRun(cwd ? { cwd } : {})
+        setRuns((previous) => [
+          run,
+          ...previous.filter((item) => item.id !== run.id),
+        ])
+        setTitles((previous) => ({ ...previous, [run.id]: '新会话' }))
+        setSelectedId(run.id)
+        setSelectedRun(run)
+        setPreferredCwd(run.cwd)
+        setEvents([])
+        setNotice('新会话已准备好')
       } catch (cause) {
         setError(toMessage(cause))
       } finally {
         setBusy(false)
       }
     },
-    [selectRun],
+    [],
   )
 
+  const changeFolder = useCallback(async (): Promise<void> => {
+    const desktopApi = window.miniClawDesktop
+    if (!desktopApi) {
+      setError('当前环境不支持文件夹选择，请在 Electron 客户端中使用。')
+      return
+    }
+    try {
+      const selected = await desktopApi.selectDirectory(currentFolder)
+      if (selected) await createConversation(selected)
+    } catch (cause) {
+      setError(toMessage(cause))
+    }
+  }, [createConversation, currentFolder])
+
   const handlePrompt = useCallback(
-    async (text: string, streamingBehavior?: PromptInput['streamingBehavior']): Promise<void> => {
+    async (
+      text: string,
+      streamingBehavior?: PromptInput['streamingBehavior'],
+    ): Promise<void> => {
       if (!selectedId) return
       setBusy(true)
       setError(null)
       setNotice(null)
+      setTitles((previous) => ({
+        ...previous,
+        [selectedId]: previous[selectedId] === '新会话'
+          ? shortTitle(text)
+          : (previous[selectedId] ?? shortTitle(text)),
+      }))
       try {
         const result = await sendPrompt(selectedId, { text, streamingBehavior })
-        setNotice(
-          result.mode === 'started'
-            ? 'prompt 已接收，agent 开始运行'
-            : 'agent 忙碌中，prompt 已按所选行为排入队列',
-        )
+        setNotice(result.mode === 'started' ? 'MiniClaw 正在处理' : '消息已排队')
       } catch (cause) {
         setError(toMessage(cause))
       } finally {
@@ -151,73 +206,104 @@ export default function App() {
   )
 
   return (
-    <div className="app-shell">
-      <header className="app-header">
-        <div>
-          <h1 className="brand">MiniAgent Console</h1>
-          <p className="muted">runs / prompt / events · SSE 实时事件</p>
-        </div>
-        <div className="header-meta">
-          {health ? (
-            <>
-              <span className="chip">
-                {health.engine.engine}@{health.engine.version}
-              </span>
-              <span className="chip">mode: {health.engine.mode}</span>
-              <span className="chip">
-                runs: {health.engine.activeRuns}/{health.engine.totalRuns}
-              </span>
-            </>
-          ) : (
-            <span className="chip">后端未连接</span>
-          )}
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={autoRefresh}
-              onChange={(event) => setAutoRefresh(event.target.checked)}
-            />
-            <span>自动刷新状态 {META_REFRESH_MS}ms</span>
-          </label>
+    <div className="chat-app">
+      <SessionSidebar
+        runs={runs}
+        selectedId={selectedId}
+        busy={busy}
+        titles={sidebarTitles}
+        onSelect={selectRun}
+        onNew={() => void createConversation(
+          currentFolder === '正在连接项目…' ? undefined : currentFolder,
+        )}
+      />
+
+      <section className="workspace">
+        <header className="workspace-header">
+          <div className="folder-context" title={currentFolder}>
+            <FolderOpen size={23} weight="regular" aria-hidden="true" />
+            <strong>{currentFolder}</strong>
+          </div>
           <button
-            className="btn btn-ghost"
+            className="header-button"
             type="button"
-            onClick={() => setRefreshKey((value) => value + 1)}
+            onClick={() => void changeFolder()}
+            disabled={busy}
           >
-            刷新
+            更换文件夹
           </button>
+          <span className={`connection-state${networkError ? ' error' : ''}`}>
+            {networkError ? '服务异常' : health ? '已连接' : '连接中'}
+          </span>
+          <button
+            className="header-button details-button"
+            type="button"
+            onClick={() => setDetailsOpen(true)}
+          >
+            <ListBullets size={18} aria-hidden="true" />
+            运行详情
+          </button>
+        </header>
+
+        <div className="message-banners" aria-live="polite">
+          {networkError ? <div className="banner banner-error">{networkError}</div> : null}
+          {error ? <div className="banner banner-error">{error}</div> : null}
+          {notice ? <div className="banner banner-notice">{notice}</div> : null}
         </div>
-      </header>
 
-      {networkError ? <div className="banner banner-error">服务异常：{networkError}</div> : null}
-      {error ? <div className="banner banner-error">{error}</div> : null}
-      {notice ? <div className="banner banner-notice">{notice}</div> : null}
+        <main className="conversation-area">
+          <ChatTimeline events={events} hasRun={Boolean(selectedId)} />
+        </main>
 
-      <main className="app-main">
-        <aside className="sidebar">
-          <RunList
-            runs={runs}
-            selectedId={selectedId}
-            busy={busy}
-            onSelect={selectRun}
-            onRefresh={() => setRefreshKey((value) => value + 1)}
-          />
-          <CreateRunForm busy={busy} defaultCwd={health?.engine.cwd} onCreate={handleCreate} />
-        </aside>
-
-        <section className="content">
-          {selectedRun ? (
-            <RunDetail run={selectedRun} />
-          ) : (
-            <div className="panel">
-              <p className="muted">选择左侧 run 或新建一个，即可查看快照并发送 prompt。</p>
-            </div>
-          )}
+        <footer className="composer-shell">
           <PromptComposer runId={selectedId} busy={busy} onSend={handlePrompt} />
-          <EventFeed events={events} hasRun={Boolean(selectedId)} />
-        </section>
-      </main>
+        </footer>
+      </section>
+
+      {detailsOpen ? (
+        <div className="drawer-layer">
+          <button
+            className="drawer-backdrop"
+            type="button"
+            aria-label="关闭运行详情"
+            onClick={() => setDetailsOpen(false)}
+          />
+          <aside className="technical-drawer" aria-label="运行详情">
+            <div className="drawer-header">
+              <div>
+                <h2>运行详情</h2>
+                <p>状态、配置与实时事件</p>
+              </div>
+              <div className="drawer-actions">
+                <button
+                  className="icon-button"
+                  type="button"
+                  aria-label="刷新运行详情"
+                  onClick={() => setRefreshKey((value) => value + 1)}
+                >
+                  <ArrowClockwise size={19} aria-hidden="true" />
+                </button>
+                <button
+                  className="icon-button"
+                  type="button"
+                  aria-label="关闭运行详情"
+                  onClick={() => setDetailsOpen(false)}
+                >
+                  <X size={20} aria-hidden="true" />
+                </button>
+              </div>
+            </div>
+            <div className="drawer-content">
+              {selectedRun ? (
+                <RunDetail run={selectedRun} />
+              ) : (
+                <p className="muted">请先选择一个会话。</p>
+              )}
+              <EventFeed events={events} hasRun={Boolean(selectedId)} />
+            </div>
+          </aside>
+        </div>
+      ) : null}
     </div>
   )
 }
-
