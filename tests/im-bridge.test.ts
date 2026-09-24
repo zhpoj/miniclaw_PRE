@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import type { AgentEventRecord, AgentRunSnapshot, PromptResult } from '../src/agent/run.js';
+import type {
+  AgentEventRecord,
+  AgentRunSnapshot,
+  PromptOptions,
+  PromptResult,
+} from '../src/agent/run.js';
 import { IMBridge, type IMBridgeEngine, type IMRun } from '../src/im/bridge.js';
 import type {
   ChannelCapabilities,
@@ -19,7 +24,7 @@ async function settle(rounds = 8): Promise<void> {
 
 class FakeRun {
   readonly id: string;
-  readonly prompts: string[] = [];
+  readonly prompts: Array<{ text: string; options: PromptOptions }> = [];
   closed = false;
   aborted = false;
   failPrompt = false;
@@ -51,9 +56,9 @@ class FakeRun {
     };
   }
 
-  async prompt(text: string): Promise<PromptResult> {
+  async prompt(text: string, options: PromptOptions = {}): Promise<PromptResult> {
     if (this.failPrompt) throw new Error('model exploded');
-    this.prompts.push(text);
+    this.prompts.push({ text, options });
     if (this.idleForever) {
       this.idle = new Promise<void>(() => undefined);
     } else {
@@ -206,7 +211,9 @@ describe('IMBridge', () => {
 
     expect(engine.created).toHaveLength(1);
     const run = engine.last();
-    expect(run.prompts).toEqual(['帮我看看 workspace']);
+    expect(run.prompts).toEqual([
+      { text: '帮我看看 workspace', options: { source: 'feishu' } },
+    ]);
 
     run.assistantSaid('workspace 里有一个 demo.html。');
     run.finish();
@@ -214,6 +221,23 @@ describe('IMBridge', () => {
 
     expect(lastText(channel)).toBe('workspace 里有一个 demo.html。');
     expect(channel.sent[0]?.conversationId).toBe('chat_1');
+  });
+
+  it('relays a desktop-approval requirement back to Feishu', async () => {
+    const { engine, channel } = setup();
+
+    await channel.ingest('请修改文件');
+    await settle();
+    const run = engine.last();
+    run.assistantSaid('需要在桌面客户端确认此操作');
+    run.finish();
+    await settle();
+
+    expect(lastText(channel)).toBe('需要在桌面客户端确认此操作');
+    expect(run.prompts[0]).toEqual({
+      text: '请修改文件',
+      options: { source: 'feishu' },
+    });
   });
 
   it('falls back to streamed deltas when no message_end arrives', async () => {
@@ -247,13 +271,18 @@ describe('IMBridge', () => {
     await settle();
 
     expect(engine.created).toHaveLength(1);
-    expect(engine.last().prompts).toEqual(['第一条', '第二条']);
+    expect(engine.last().prompts).toEqual([
+      { text: '第一条', options: { source: 'feishu' } },
+      { text: '第二条', options: { source: 'feishu' } },
+    ]);
 
     await channel.ingest('另一头的消息', 'chat_2');
     await settle();
     expect(engine.created).toHaveLength(2);
     expect(engine.last().id).toBe('run_2');
-    expect(engine.last().prompts).toEqual(['另一头的消息']);
+    expect(engine.last().prompts).toEqual([
+      { text: '另一头的消息', options: { source: 'feishu' } },
+    ]);
   });
 
   it('queues messages arriving while a turn is running', async () => {
@@ -265,7 +294,9 @@ describe('IMBridge', () => {
 
     await channel.ingest('还有这个');
     await settle();
-    expect(first.prompts).toEqual(['先做这个']);
+    expect(first.prompts).toEqual([
+      { text: '先做这个', options: { source: 'feishu' } },
+    ]);
     expect(channel.texts().some((text) => text.includes('已排队'))).toBe(true);
     expect(engine.created).toHaveLength(1);
 
@@ -273,7 +304,10 @@ describe('IMBridge', () => {
     first.finish();
     await settle();
 
-    expect(first.prompts).toEqual(['先做这个', '还有这个']);
+    expect(first.prompts).toEqual([
+      { text: '先做这个', options: { source: 'feishu' } },
+      { text: '还有这个', options: { source: 'feishu' } },
+    ]);
     expect(channel.texts()).toContain('第一个任务好了');
   });
 
@@ -307,7 +341,9 @@ describe('IMBridge', () => {
     await channel.ingest('重新开始');
     await settle();
     expect(engine.created).toHaveLength(2);
-    expect(engine.last().prompts).toEqual(['重新开始']);
+    expect(engine.last().prompts).toEqual([
+      { text: '重新开始', options: { source: 'feishu' } },
+    ]);
   });
 
   it('answers /status with the current run', async () => {

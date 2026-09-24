@@ -258,7 +258,7 @@ export class IMBridge {
         }
       }
 
-      await run.prompt(message.text);
+      await run.prompt(message.text, { source: 'feishu' });
       await this.waitForIdle(run);
 
       await this.deliver(channel, binding, collector.text(), replyId);
