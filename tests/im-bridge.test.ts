@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { ApprovalManager } from '../src/agent/approval.js';
 import type {
   AgentEventRecord,
   AgentRunSnapshot,
@@ -9,6 +10,8 @@ import type {
 import { IMBridge, type IMBridgeEngine, type IMRun } from '../src/im/bridge.js';
 import type {
   ChannelCapabilities,
+  CardAction,
+  CardActionHandler,
   IMChannel,
   InboundMessage,
   InboundMessageHandler,
@@ -20,6 +23,13 @@ async function settle(rounds = 8): Promise<void> {
   for (let index = 0; index < rounds; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
+}
+
+function feishuOptions(conversationId = 'chat_1'): PromptOptions {
+  return {
+    source: 'feishu',
+    principal: { channelId: 'feishu', conversationId, senderId: 'user_1' },
+  };
 }
 
 class FakeRun {
@@ -119,11 +129,16 @@ class FakeRun {
 
 class FakeEngine {
   readonly created: FakeRun[] = [];
+  readonly approvals = new ApprovalManager();
 
   async createRun(): Promise<IMRun> {
     const run = new FakeRun(`run_${this.created.length + 1}`);
     this.created.push(run);
     return run as unknown as IMRun;
+  }
+
+  getApprovalManager(): ApprovalManager {
+    return this.approvals;
   }
 
   last(): FakeRun {
@@ -134,7 +149,7 @@ class FakeEngine {
 }
 
 class FakeChannel implements IMChannel {
-  readonly id = 'fake';
+  readonly id = 'feishu';
   readonly capabilities: ChannelCapabilities = {
     streamingCards: true,
     persistentInbox: false,
@@ -142,8 +157,10 @@ class FakeChannel implements IMChannel {
 
   readonly sent: Array<{ conversationId: string; content: OutboundContent }> = [];
   readonly updates: Array<{ messageId: string; content: OutboundContent }> = [];
+  failSend = false;
 
   private readonly handlers = new Set<InboundMessageHandler>();
+  private readonly cardActionHandlers = new Set<CardActionHandler>();
   private counter = 0;
 
   async start(): Promise<void> {}
@@ -153,6 +170,7 @@ class FakeChannel implements IMChannel {
     conversationId: string,
     content: OutboundContent,
   ): Promise<{ messageId: string }> {
+    if (this.failSend) throw new Error('send failed');
     this.sent.push({ conversationId, content });
     this.counter += 1;
     return { messageId: `msg_${this.counter}` };
@@ -169,6 +187,13 @@ class FakeChannel implements IMChannel {
     };
   }
 
+  onCardAction(handler: CardActionHandler): () => void {
+    this.cardActionHandlers.add(handler);
+    return () => {
+      this.cardActionHandlers.delete(handler);
+    };
+  }
+
   /** Test helper: deliver a message the way an adapter would. */
   async ingest(text: string, conversationId = 'chat_1'): Promise<void> {
     this.counter += 1;
@@ -181,6 +206,10 @@ class FakeChannel implements IMChannel {
       raw: {},
     };
     for (const handler of this.handlers) await handler(message);
+  }
+
+  async emitCardAction(action: CardAction): Promise<void> {
+    for (const handler of this.cardActionHandlers) await handler(action);
   }
 
   texts(): string[] {
@@ -203,6 +232,60 @@ function setup(options: Partial<ConstructorParameters<typeof IMBridge>[1]> = {})
 }
 
 describe('IMBridge', () => {
+  it('sends a Feishu approval card and lets only its sender allow once', async () => {
+    const { engine, channel } = setup();
+
+    await channel.ingest('请执行测试');
+    await settle();
+    engine.approvals.beginTurn('run_1', 'turn_1', 'feishu');
+    const pending = engine.approvals.request({
+      runId: 'run_1',
+      turnId: 'turn_1',
+      source: 'feishu',
+      principal: { channelId: 'feishu', conversationId: 'chat_1', senderId: 'user_1' },
+      cwd: 'F:\\demo',
+      toolName: 'powershell',
+      input: { command: 'npm test' },
+    });
+    await settle();
+
+    expect(channel.sent).toHaveLength(1);
+    expect(channel.sent[0]?.content.card).toBeDefined();
+
+    await channel.emitCardAction({
+      channelId: 'feishu', actorId: 'other_user', approvalId: engine.approvals.listPending()[0]!.id,
+      decision: 'allow_once',
+    });
+    expect(engine.approvals.listPending()).toHaveLength(1);
+    expect(channel.updates).toHaveLength(0);
+
+    await channel.emitCardAction({
+      channelId: 'feishu', actorId: 'user_1', approvalId: engine.approvals.listPending()[0]!.id,
+      decision: 'allow_once',
+    });
+    await expect(pending).resolves.toEqual({ allowed: true, scope: 'once' });
+    await settle();
+    expect(channel.updates).toHaveLength(1);
+  });
+
+  it('denies the pending operation when approval-card delivery fails', async () => {
+    const { engine, channel } = setup();
+    channel.failSend = true;
+    engine.approvals.beginTurn('run_1', 'turn_1', 'feishu');
+
+    const pending = engine.approvals.request({
+      runId: 'run_1',
+      turnId: 'turn_1',
+      source: 'feishu',
+      principal: { channelId: 'feishu', conversationId: 'chat_1', senderId: 'user_1' },
+      cwd: 'F:\\demo',
+      toolName: 'powershell',
+      input: { command: 'npm test' },
+    });
+
+    await expect(pending).resolves.toEqual({ allowed: false, reason: '用户拒绝了此操作' });
+  });
+
   it('sends one inbound message to a fresh agent run and answers back', async () => {
     const { engine, channel } = setup();
 
@@ -212,7 +295,7 @@ describe('IMBridge', () => {
     expect(engine.created).toHaveLength(1);
     const run = engine.last();
     expect(run.prompts).toEqual([
-      { text: '帮我看看 workspace', options: { source: 'feishu' } },
+      { text: '帮我看看 workspace', options: feishuOptions() },
     ]);
 
     run.assistantSaid('workspace 里有一个 demo.html。');
@@ -236,7 +319,7 @@ describe('IMBridge', () => {
     expect(lastText(channel)).toBe('需要在桌面客户端确认此操作');
     expect(run.prompts[0]).toEqual({
       text: '请修改文件',
-      options: { source: 'feishu' },
+      options: feishuOptions(),
     });
   });
 
@@ -272,8 +355,8 @@ describe('IMBridge', () => {
 
     expect(engine.created).toHaveLength(1);
     expect(engine.last().prompts).toEqual([
-      { text: '第一条', options: { source: 'feishu' } },
-      { text: '第二条', options: { source: 'feishu' } },
+      { text: '第一条', options: feishuOptions() },
+      { text: '第二条', options: feishuOptions() },
     ]);
 
     await channel.ingest('另一头的消息', 'chat_2');
@@ -281,7 +364,7 @@ describe('IMBridge', () => {
     expect(engine.created).toHaveLength(2);
     expect(engine.last().id).toBe('run_2');
     expect(engine.last().prompts).toEqual([
-      { text: '另一头的消息', options: { source: 'feishu' } },
+      { text: '另一头的消息', options: feishuOptions('chat_2') },
     ]);
   });
 
@@ -295,7 +378,7 @@ describe('IMBridge', () => {
     await channel.ingest('还有这个');
     await settle();
     expect(first.prompts).toEqual([
-      { text: '先做这个', options: { source: 'feishu' } },
+      { text: '先做这个', options: feishuOptions() },
     ]);
     expect(channel.texts().some((text) => text.includes('已排队'))).toBe(true);
     expect(engine.created).toHaveLength(1);
@@ -305,8 +388,8 @@ describe('IMBridge', () => {
     await settle();
 
     expect(first.prompts).toEqual([
-      { text: '先做这个', options: { source: 'feishu' } },
-      { text: '还有这个', options: { source: 'feishu' } },
+      { text: '先做这个', options: feishuOptions() },
+      { text: '还有这个', options: feishuOptions() },
     ]);
     expect(channel.texts()).toContain('第一个任务好了');
   });
@@ -342,7 +425,7 @@ describe('IMBridge', () => {
     await settle();
     expect(engine.created).toHaveLength(2);
     expect(engine.last().prompts).toEqual([
-      { text: '重新开始', options: { source: 'feishu' } },
+      { text: '重新开始', options: feishuOptions() },
     ]);
   });
 

@@ -13,10 +13,12 @@
 
 import type { AgentEngine } from '../agent/engine.js';
 import type { AgentEventRecord, AgentRun } from '../agent/run.js';
-import type { IMChannel, InboundMessage, OutboundContent } from './IMChannel.js';
+import type { ApprovalEvent, ApprovalManager, ApprovalRecord } from '../agent/approval.js';
+import { buildApprovalCard } from './approval-card.js';
+import type { CardAction, IMChannel, InboundMessage, OutboundContent } from './IMChannel.js';
 
 /** Only the engine surface the bridge touches, so tests can inject a fake. */
-export type IMBridgeEngine = Pick<AgentEngine, 'createRun'>;
+export type IMBridgeEngine = Pick<AgentEngine, 'createRun' | 'getApprovalManager'>;
 /** Only the run surface the bridge touches. `AgentRun` satisfies it structurally. */
 export type IMRun = Pick<
   AgentRun,
@@ -88,6 +90,11 @@ interface ConversationBinding {
   updatedAt: number;
 }
 
+interface ApprovalCardBinding {
+  readonly channel: IMChannel;
+  readonly messageId: string;
+}
+
 export interface ConversationSnapshot {
   readonly key: string;
   readonly channelId: string;
@@ -103,14 +110,22 @@ export interface ConversationSnapshot {
  */
 export class IMBridge {
   private readonly engine: IMBridgeEngine;
+  private readonly approvals: ApprovalManager;
   private readonly options: IMBridgeOptions;
   private readonly channels = new Map<string, IMChannel>();
   private readonly subscriptions = new Map<string, () => void>();
+  private readonly cardActionSubscriptions = new Map<string, () => void>();
   private readonly bindings = new Map<string, ConversationBinding>();
+  private readonly approvalCards = new Map<string, ApprovalCardBinding>();
+  private readonly unsubscribeApprovals: () => void;
 
   constructor(engine: IMBridgeEngine, options: Partial<IMBridgeOptions> = {}) {
     this.engine = engine;
+    this.approvals = engine.getApprovalManager();
     this.options = { ...DEFAULT_IM_BRIDGE_OPTIONS, ...options };
+    this.unsubscribeApprovals = this.approvals.subscribe((event) => {
+      this.onApprovalEvent(event);
+    });
   }
 
   /**
@@ -125,6 +140,11 @@ export class IMBridge {
     });
     this.channels.set(channel.id, channel);
     this.subscriptions.set(channel.id, unsubscribe);
+    if (channel.onCardAction) {
+      this.cardActionSubscriptions.set(channel.id, channel.onCardAction((action) => {
+        void this.handleCardAction(action);
+      }));
+    }
     return () => {
       this.detach(channel.id);
     };
@@ -133,7 +153,12 @@ export class IMBridge {
   detach(channelId: string): void {
     this.subscriptions.get(channelId)?.();
     this.subscriptions.delete(channelId);
+    this.cardActionSubscriptions.get(channelId)?.();
+    this.cardActionSubscriptions.delete(channelId);
     this.channels.delete(channelId);
+    for (const [approvalId, card] of this.approvalCards) {
+      if (card.channel.id === channelId) this.approvalCards.delete(approvalId);
+    }
   }
 
   /**
@@ -197,6 +222,10 @@ export class IMBridge {
   dispose(): void {
     for (const unsubscribe of this.subscriptions.values()) unsubscribe();
     this.subscriptions.clear();
+    for (const unsubscribe of this.cardActionSubscriptions.values()) unsubscribe();
+    this.cardActionSubscriptions.clear();
+    this.unsubscribeApprovals();
+    this.approvalCards.clear();
     this.channels.clear();
     for (const binding of this.bindings.values()) {
       binding.queue = [];
@@ -258,7 +287,18 @@ export class IMBridge {
         }
       }
 
-      await run.prompt(message.text, { source: 'feishu' });
+      await run.prompt(message.text, {
+        source: 'feishu',
+        ...(message.channelId === 'feishu'
+          ? {
+              principal: {
+                channelId: 'feishu' as const,
+                conversationId: message.conversationId,
+                senderId: message.senderId,
+              },
+            }
+          : {}),
+      });
       await this.waitForIdle(run);
 
       await this.deliver(channel, binding, collector.text(), replyId);
@@ -281,6 +321,64 @@ export class IMBridge {
     const next = binding.queue.shift();
     if (!next) return;
     this.startTurn(channel, binding, next);
+  }
+
+  private onApprovalEvent(event: ApprovalEvent): void {
+    if (event.type === 'approval_requested') {
+      void this.sendApprovalCard(event.approval);
+      return;
+    }
+    void this.updateApprovalCard(event.approval);
+  }
+
+  private async sendApprovalCard(record: ApprovalRecord): Promise<void> {
+    const principal = record.principal;
+    if (!principal) return;
+    const channel = this.channels.get(principal.channelId);
+    if (!channel) {
+      this.denyApprovalAfterDeliveryFailure(record.id);
+      return;
+    }
+    try {
+      const sent = await channel.send(principal.conversationId, {
+        card: buildApprovalCard(record),
+      });
+      this.approvalCards.set(record.id, { channel, messageId: sent.messageId });
+    } catch (error) {
+      console.error('[im] failed to send approval card:', describeError(error));
+      this.denyApprovalAfterDeliveryFailure(record.id);
+    }
+  }
+
+  private denyApprovalAfterDeliveryFailure(approvalId: string): void {
+    try {
+      this.approvals.decide(approvalId, 'deny');
+    } catch (error) {
+      console.warn('[im] approval card could not be denied:', describeError(error));
+    }
+  }
+
+  private async updateApprovalCard(record: ApprovalRecord): Promise<void> {
+    const card = this.approvalCards.get(record.id);
+    if (!card) return;
+    this.approvalCards.delete(record.id);
+    try {
+      await card.channel.update(card.messageId, { card: buildApprovalCard(record) });
+    } catch (error) {
+      console.error('[im] failed to update approval card:', describeError(error));
+    }
+  }
+
+  private async handleCardAction(action: CardAction): Promise<void> {
+    try {
+      this.approvals.decideFromFeishu({
+        id: action.approvalId,
+        actorId: action.actorId,
+        decision: action.decision,
+      });
+    } catch (error) {
+      console.warn('[im] ignored approval card action:', describeError(error));
+    }
   }
 
   private async deliver(
