@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { AgentEventRecord } from './api'
+import type { AgentEventRecord, ApprovalRecord } from './api'
 import { buildConversation } from './conversation'
 
 describe('buildConversation', () => {
@@ -63,6 +63,85 @@ describe('buildConversation', () => {
         role: 'assistant',
         text: '登录页检查完成。',
         at: '2026-09-24T01:00:03.000Z',
+      },
+    ])
+  })
+
+  it('updates one approval item across requested, replayed, and resolved events', () => {
+    const pending: ApprovalRecord = {
+      id: 'approval-1',
+      runId: 'run-1',
+      turnId: 'turn-1',
+      toolName: 'powershell',
+      source: 'desktop',
+      cwd: 'F:\\project',
+      summary: 'npm test',
+      details: { command: 'npm test' },
+      status: 'pending',
+      createdAt: '2026-09-24T01:00:00.000Z',
+      expiresAt: '2026-09-24T01:01:00.000Z',
+    }
+    const allowed = { ...pending, status: 'allowed' as const }
+    const events: AgentEventRecord[] = [
+      {
+        seq: 0,
+        at: pending.createdAt,
+        type: 'approval_requested',
+        payload: { approval: pending },
+      },
+      {
+        seq: 1,
+        at: pending.createdAt,
+        type: 'approval_requested',
+        payload: { approval: pending },
+      },
+      {
+        seq: 2,
+        at: '2026-09-24T01:00:02.000Z',
+        type: 'approval_resolved',
+        payload: { approval: allowed },
+      },
+    ]
+
+    expect(buildConversation(events)).toEqual([
+      {
+        id: 'approval-approval-1',
+        kind: 'approval',
+        approval: allowed,
+        at: pending.createdAt,
+      },
+    ])
+  })
+
+  it('merges REST-recovered pending approvals without duplicating SSE items', () => {
+    const approval: ApprovalRecord = {
+      id: 'approval-2',
+      runId: 'run-1',
+      turnId: 'turn-1',
+      toolName: 'write',
+      source: 'feishu',
+      cwd: 'F:\\project',
+      summary: '写入文件 src/a.ts（5 个字符）',
+      details: { path: 'src/a.ts' },
+      status: 'pending',
+      createdAt: '2026-09-24T01:00:00.000Z',
+      expiresAt: '2026-09-24T01:01:00.000Z',
+    }
+    const events: AgentEventRecord[] = [
+      {
+        seq: 0,
+        at: approval.createdAt,
+        type: 'approval_requested',
+        payload: { approval },
+      },
+    ]
+
+    expect(buildConversation(events, [approval])).toEqual([
+      {
+        id: 'approval-approval-2',
+        kind: 'approval',
+        approval,
+        at: approval.createdAt,
       },
     ])
   })

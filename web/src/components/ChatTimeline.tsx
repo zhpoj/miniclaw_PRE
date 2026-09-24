@@ -63,6 +63,8 @@ export default function ChatTimeline({ events, hasRun }: Props) {
             )
           }
 
+          if (item.kind === 'approval') return null
+
           return (
             <article className={`chat-message ${item.role}`} key={item.id}>
               <div className="message-copy">{item.text}</div>

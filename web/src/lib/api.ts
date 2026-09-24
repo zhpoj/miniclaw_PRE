@@ -10,6 +10,28 @@ const API_BASE = String(import.meta.env.VITE_API_BASE ?? '/api');
 export type AgentRunStatus = 'starting' | 'idle' | 'running' | 'error' | 'closed';
 
 export type StreamingBehavior = 'steer' | 'followUp';
+export type PromptSource = 'desktop' | 'web' | 'feishu';
+export type ApprovalDecision = 'allow_once' | 'allow_turn' | 'deny';
+export type ApprovalStatus =
+  | 'pending'
+  | 'allowed'
+  | 'denied'
+  | 'expired'
+  | 'cancelled';
+
+export interface ApprovalRecord {
+  id: string;
+  runId: string;
+  turnId: string;
+  toolName: 'edit' | 'write' | 'powershell';
+  source: PromptSource;
+  cwd: string;
+  summary: string;
+  details: Record<string, unknown>;
+  status: ApprovalStatus;
+  createdAt: string;
+  expiresAt: string;
+}
 
 export type ThinkingLevel =
   | 'off'
@@ -55,6 +77,7 @@ export interface CreateRunInput {
 export interface PromptInput {
   text: string;
   streamingBehavior?: StreamingBehavior;
+  source?: PromptSource;
 }
 
 export interface PromptResult {
@@ -187,6 +210,33 @@ export function sendPrompt(runId: string, input: PromptInput): Promise<PromptRes
   return request<PromptResult>(`/agent/runs/${target}/prompt`, jsonInit('POST', input));
 }
 
+export function listPendingApprovals(
+  runId?: string,
+): Promise<{ approvals: ApprovalRecord[] }> {
+  const query = runId
+    ? `?status=pending&runId=${encodeURIComponent(runId)}`
+    : '?status=pending';
+  return request<{ approvals: ApprovalRecord[] }>(`/agent/approvals${query}`);
+}
+
+export function decideApproval(
+  id: string,
+  decision: ApprovalDecision,
+): Promise<ApprovalRecord> {
+  const target = encodeURIComponent(id);
+  return request<ApprovalRecord>(
+    `/agent/approvals/${target}/decision`,
+    jsonInit('POST', { decision }),
+  );
+}
+
+export function heartbeatApprovalClient(clientId: string): Promise<{ active: true }> {
+  return request<{ active: true }>(
+    '/agent/approval-clients/heartbeat',
+    jsonInit('POST', { clientId }),
+  );
+}
+
 /** `GET /agent/runs/:id` - single run snapshot, used for the status card. */
 export function fetchRun(runId: string): Promise<AgentRunSnapshot> {
   const target = encodeURIComponent(runId);
@@ -289,4 +339,3 @@ export function subscribeRun(
 
   return () => controller.abort();
 }
-

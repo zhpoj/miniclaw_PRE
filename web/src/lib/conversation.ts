@@ -1,4 +1,4 @@
-import type { AgentEventRecord } from './api'
+import type { AgentEventRecord, ApprovalRecord } from './api'
 
 export type ConversationItem =
   | {
@@ -6,6 +6,12 @@ export type ConversationItem =
       kind: 'message'
       role: 'user' | 'assistant'
       text: string
+      at: string
+    }
+  | {
+      id: string
+      kind: 'approval'
+      approval: ApprovalRecord
       at: string
     }
   | {
@@ -42,14 +48,65 @@ function toolLabel(name: string): string {
   return labels[name] ?? `运行工具：${name}`
 }
 
-export function buildConversation(events: AgentEventRecord[]): ConversationItem[] {
+function approvalFrom(value: unknown): ApprovalRecord | null {
+  if (!isRecord(value)) return null
+  if (
+    typeof value.id !== 'string' ||
+    typeof value.runId !== 'string' ||
+    typeof value.turnId !== 'string' ||
+    typeof value.toolName !== 'string' ||
+    typeof value.source !== 'string' ||
+    typeof value.cwd !== 'string' ||
+    typeof value.summary !== 'string' ||
+    typeof value.status !== 'string' ||
+    typeof value.createdAt !== 'string' ||
+    typeof value.expiresAt !== 'string'
+  ) {
+    return null
+  }
+  return {
+    ...(value as unknown as ApprovalRecord),
+    details: isRecord(value.details) ? value.details : {},
+  }
+}
+
+export function buildConversation(
+  events: AgentEventRecord[],
+  recoveredApprovals: ApprovalRecord[] = [],
+): ConversationItem[] {
   const items: ConversationItem[] = []
   const activityIndexes = new Map<string, number>()
+  const approvalIndexes = new Map<string, number>()
   let streamingText = ''
   let streamingAt = ''
 
   for (const event of events) {
     const payload = isRecord(event.payload) ? event.payload : {}
+
+    if (
+      event.type === 'approval_requested' ||
+      event.type === 'approval_resolved' ||
+      event.type === 'approval_expired'
+    ) {
+      const approval = approvalFrom(payload.approval)
+      if (!approval) continue
+      const existingIndex = approvalIndexes.get(approval.id)
+      if (existingIndex === undefined) {
+        approvalIndexes.set(approval.id, items.length)
+        items.push({
+          id: `approval-${approval.id}`,
+          kind: 'approval',
+          approval,
+          at: event.at,
+        })
+      } else {
+        const existing = items[existingIndex]
+        if (existing?.kind === 'approval') {
+          items[existingIndex] = { ...existing, approval }
+        }
+      }
+      continue
+    }
 
     if (event.type === 'message_update') {
       const update = isRecord(payload.assistantMessageEvent)
@@ -135,6 +192,17 @@ export function buildConversation(events: AgentEventRecord[]): ConversationItem[
       role: 'assistant',
       text: streamingText.trim(),
       at: streamingAt,
+    })
+  }
+
+  for (const approval of recoveredApprovals) {
+    if (approvalIndexes.has(approval.id)) continue
+    approvalIndexes.set(approval.id, items.length)
+    items.push({
+      id: `approval-${approval.id}`,
+      kind: 'approval',
+      approval,
+      at: approval.createdAt,
     })
   }
 
