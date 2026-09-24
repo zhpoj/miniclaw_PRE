@@ -2,8 +2,13 @@ import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type {
+  ReliabilityQueueInput,
+  ReliabilityQueueItem,
+  ReliabilityStatus,
+} from './reliability.js';
 
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 export interface StoredMessageInput {
   channelId: string;
@@ -124,6 +129,131 @@ export class SqliteStore {
     }
   }
 
+  enqueueReliability(input: ReliabilityQueueInput): string {
+    const existing = this.db.prepare(
+      'SELECT id FROM reliability_queue WHERE idempotency_key = ?',
+    ).get(input.idempotencyKey) as { id: string } | undefined;
+    if (existing) return existing.id;
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO reliability_queue(
+        id, channel_id, conversation_id, idempotency_key, payload_json,
+        status, attempts, next_attempt_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+    `).run(
+      id,
+      input.channelId,
+      input.conversationId,
+      input.idempotencyKey,
+      JSON.stringify(input.payload),
+      input.nextAttemptAt,
+      now,
+      now,
+    );
+    return id;
+  }
+
+  claimReliability(now: string, limit = 50): ReliabilityQueueItem[] {
+    const rows = this.db.prepare(`
+      SELECT id FROM reliability_queue
+      WHERE status IN ('pending', 'failed') AND next_attempt_at <= ?
+      ORDER BY next_attempt_at, created_at
+      LIMIT ?
+    `).all(now, limit) as Array<{ id: string }>;
+    if (rows.length === 0) return [];
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const claimed: ReliabilityQueueItem[] = [];
+      for (const row of rows) {
+        const result = this.db.prepare(`
+          UPDATE reliability_queue
+          SET status = 'sending', attempts = attempts + 1, updated_at = ?
+          WHERE id = ? AND status IN ('pending', 'failed')
+        `).run(now, row.id);
+        if (Number(result.changes) === 0) continue;
+        const item = this.readReliability(row.id);
+        if (item) claimed.push(item);
+      }
+      this.db.exec('COMMIT');
+      return claimed;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  markReliabilitySent(id: string): void {
+    this.db.prepare(`
+      UPDATE reliability_queue SET status = 'sent', updated_at = ? WHERE id = ?
+    `).run(new Date().toISOString(), id);
+  }
+
+  markReliabilityFailed(
+    id: string,
+    error: string,
+    nextAttemptAt: string,
+    dead: boolean,
+  ): void {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.readReliability(id);
+      if (!row) {
+        this.db.exec('COMMIT');
+        return;
+      }
+      this.db.prepare(`
+        INSERT INTO reliability_attempts(id, queue_id, attempt, error, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(randomUUID(), id, row.attempts, error, now);
+      this.db.prepare(`
+        UPDATE reliability_queue
+        SET status = ?, last_error = ?, next_attempt_at = ?, updated_at = ?
+        WHERE id = ?
+      `).run(dead ? 'dead' : 'failed', error, nextAttemptAt, now, id);
+      this.db.exec('COMMIT');
+    } catch (cause) {
+      this.db.exec('ROLLBACK');
+      throw cause;
+    }
+  }
+
+  recoverReliability(now: string): number {
+    const result = this.db.prepare(`
+      UPDATE reliability_queue
+      SET status = 'pending', next_attempt_at = ?, updated_at = ?
+      WHERE status = 'sending'
+    `).run(now, now);
+    return Number(result.changes);
+  }
+
+  private readReliability(id: string): ReliabilityQueueItem | undefined {
+    const row = this.db.prepare(`
+      SELECT id, channel_id, conversation_id, idempotency_key, payload_json,
+        status, attempts, next_attempt_at, last_error, created_at, updated_at
+      FROM reliability_queue WHERE id = ?
+    `).get(id) as {
+      id: string; channel_id: string; conversation_id: string; idempotency_key: string;
+      payload_json: string; status: ReliabilityStatus; attempts: number;
+      next_attempt_at: string; last_error: string | null; created_at: string; updated_at: string;
+    } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      channelId: row.channel_id,
+      conversationId: row.conversation_id,
+      idempotencyKey: row.idempotency_key,
+      payload: JSON.parse(row.payload_json) as Record<string, unknown>,
+      status: row.status,
+      attempts: row.attempts,
+      nextAttemptAt: row.next_attempt_at,
+      lastError: row.last_error ?? undefined,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
   private migrate(): void {
     this.db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
     const version = this.schemaVersion();
@@ -178,6 +308,28 @@ export class SqliteStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS reliability_queue (
+        id TEXT PRIMARY KEY,
+        channel_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'failed', 'dead')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT NOT NULL,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS reliability_attempts (
+        id TEXT PRIMARY KEY,
+        queue_id TEXT NOT NULL REFERENCES reliability_queue(id),
+        attempt INTEGER NOT NULL,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_reliability_due
+        ON reliability_queue(status, next_attempt_at);
     `);
     if (version < 2) {
       const columns = this.db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;
