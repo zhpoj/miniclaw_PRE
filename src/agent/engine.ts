@@ -15,6 +15,7 @@ import {
   type ExecutionMode,
   type WorkspaceConfig,
 } from './workspace.js';
+import type { SqliteStore } from '../storage/sqlite.js';
 
 export const ENGINE_NAME = '@earendil-works/pi-coding-agent';
 
@@ -33,6 +34,8 @@ export interface AgentEngineOptions {
   allowModelNetwork?: boolean;
   /** Approval state shared by all runs. Primarily injectable for tests. */
   approvals?: ApprovalManager;
+  /** Optional SQLite runtime-state store for usage accounting. */
+  store?: SqliteStore;
 }
 
 export interface AgentEngineInfo {
@@ -77,10 +80,12 @@ export class AgentEngine {
   private readonly workspace: WorkspaceConfig;
   private readonly allowModelNetwork: boolean;
   private readonly approvals: ApprovalManager;
+  private readonly store: SqliteStore | undefined;
   private runtimePromise: Promise<ModelRuntime> | undefined;
 
   constructor(options: AgentEngineOptions = {}) {
     this.approvals = options.approvals ?? new ApprovalManager();
+    this.store = options.store;
     this.workspace = options.workspace ?? resolveWorkspace();
     this.defaults = {
       cwd: options.cwd ?? this.workspace.activePath,
@@ -123,6 +128,7 @@ export class AgentEngine {
       resolved,
       this.defaults,
       this.approvals,
+      this.store,
     );
     this.runs.set(run.id, run);
     return run;
@@ -180,8 +186,9 @@ export class AgentEngine {
 }
 
 /** Engine configured from environment variables. */
-export function createEngineFromEnv(): AgentEngine {
+export function createEngineFromEnv(config: Pick<AgentEngineOptions, 'store'> = {}): AgentEngine {
   const options: AgentEngineOptions = {
+    ...config,
     allowModelNetwork: process.env['AGENT_ALLOW_MODEL_NETWORK'] === '1',
     persistSessions: process.env['AGENT_PERSIST_SESSIONS'] === '1',
   };

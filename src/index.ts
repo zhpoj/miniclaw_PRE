@@ -7,8 +7,8 @@ import { createServerListenOptions } from './server-config.js';
 import { SqliteStore } from './storage/sqlite.js';
 
 const port = Number(process.env.PORT ?? 3000);
-const engine = createEngineFromEnv();
 const store = new SqliteStore();
+const engine = createEngineFromEnv({ store });
 const app = createApp({ engine, store });
 const im = getMountedIM(app);
 

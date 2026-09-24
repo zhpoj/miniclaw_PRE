@@ -7,8 +7,9 @@ import type {
   ReliabilityQueueItem,
   ReliabilityStatus,
 } from './reliability.js';
+import type { UsageLedgerEntry, UsageLedgerFilter, UsageLedgerRow } from './usage.js';
 
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
 
 export interface StoredMessageInput {
   channelId: string;
@@ -228,6 +229,71 @@ export class SqliteStore {
     return Number(result.changes);
   }
 
+  appendUsage(input: UsageLedgerEntry): string {
+    const id = randomUUID();
+    this.db.prepare(`
+      INSERT INTO usage_ledger(
+        id, run_id, conversation_id, workspace_id, agent_profile_id,
+        provider, model, input_tokens, output_tokens, cache_tokens,
+        latency_ms, estimated_cost, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      input.runId,
+      input.conversationId ?? null,
+      input.workspaceId ?? null,
+      input.agentProfileId ?? null,
+      input.provider,
+      input.model,
+      input.inputTokens ?? null,
+      input.outputTokens ?? null,
+      input.cacheTokens ?? null,
+      input.latencyMs ?? null,
+      input.estimatedCost ?? null,
+      input.createdAt,
+    );
+    return id;
+  }
+
+  listUsage(filter: UsageLedgerFilter = {}): UsageLedgerRow[] {
+    const clauses: string[] = [];
+    const params: Array<string> = [];
+    if (filter.model) {
+      clauses.push('model = ?');
+      params.push(filter.model);
+    }
+    if (filter.from) {
+      clauses.push('created_at >= ?');
+      params.push(filter.from);
+    }
+    if (filter.to) {
+      clauses.push('created_at <= ?');
+      params.push(filter.to);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`
+      SELECT id, run_id, conversation_id, workspace_id, agent_profile_id,
+        provider, model, input_tokens, output_tokens, cache_tokens,
+        latency_ms, estimated_cost, created_at
+      FROM usage_ledger ${where} ORDER BY created_at, id
+    `).all(...params) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      id: String(row['id']),
+      runId: String(row['run_id']),
+      ...(row['conversation_id'] === null ? {} : { conversationId: String(row['conversation_id']) }),
+      ...(row['workspace_id'] === null ? {} : { workspaceId: String(row['workspace_id']) }),
+      ...(row['agent_profile_id'] === null ? {} : { agentProfileId: String(row['agent_profile_id']) }),
+      provider: String(row['provider']),
+      model: String(row['model']),
+      ...(row['input_tokens'] === null ? {} : { inputTokens: Number(row['input_tokens']) }),
+      ...(row['output_tokens'] === null ? {} : { outputTokens: Number(row['output_tokens']) }),
+      ...(row['cache_tokens'] === null ? {} : { cacheTokens: Number(row['cache_tokens']) }),
+      ...(row['latency_ms'] === null ? {} : { latencyMs: Number(row['latency_ms']) }),
+      ...(row['estimated_cost'] === null ? {} : { estimatedCost: Number(row['estimated_cost']) }),
+      createdAt: String(row['created_at']),
+    }));
+  }
+
   private readReliability(id: string): ReliabilityQueueItem | undefined {
     const row = this.db.prepare(`
       SELECT id, channel_id, conversation_id, idempotency_key, payload_json,
@@ -330,6 +396,23 @@ export class SqliteStore {
       );
       CREATE INDEX IF NOT EXISTS idx_reliability_due
         ON reliability_queue(status, next_attempt_at);
+      CREATE TABLE IF NOT EXISTS usage_ledger (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        conversation_id TEXT,
+        workspace_id TEXT,
+        agent_profile_id TEXT,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_tokens INTEGER,
+        latency_ms INTEGER,
+        estimated_cost REAL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_usage_model_created
+        ON usage_ledger(model, created_at);
     `);
     if (version < 2) {
       const columns = this.db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;

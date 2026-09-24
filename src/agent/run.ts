@@ -19,6 +19,43 @@ import {
   type FeishuApprovalPrincipal,
   type PromptSource,
 } from './approval.js';
+import type { SqliteStore } from '../storage/sqlite.js';
+import type { UsageLedgerEntry } from '../storage/usage.js';
+
+export function usageLedgerEntryFromAssistantMessage(
+  runId: string,
+  message: unknown,
+  latencyMs?: number,
+): UsageLedgerEntry | undefined {
+  if (!message || typeof message !== 'object') return undefined;
+  const candidate = message as Record<string, unknown>;
+  if (candidate['role'] !== 'assistant') return undefined;
+  const usage = candidate['usage'];
+  if (!usage || typeof usage !== 'object') return undefined;
+  const values = usage as Record<string, unknown>;
+  const provider = typeof candidate['provider'] === 'string' ? candidate['provider'] : undefined;
+  const model = typeof candidate['model'] === 'string' ? candidate['model'] : undefined;
+  if (!provider || !model) return undefined;
+  const numberValue = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  const cacheRead = numberValue(values['cacheRead']) ?? 0;
+  const cacheWrite = numberValue(values['cacheWrite']) ?? 0;
+  const cost = values['cost'];
+  const totalCost = cost && typeof cost === 'object' ? numberValue((cost as Record<string, unknown>)['total']) : undefined;
+  const timestamp = numberValue(candidate['timestamp']);
+  const inputTokens = numberValue(values['input']);
+  const outputTokens = numberValue(values['output']);
+  return {
+    runId,
+    provider,
+    model,
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...((cacheRead + cacheWrite) === 0 ? {} : { cacheTokens: cacheRead + cacheWrite }),
+    ...(totalCost === undefined ? {} : { estimatedCost: totalCost }),
+    ...(latencyMs === undefined ? {} : { latencyMs }),
+    createdAt: timestamp === undefined ? new Date().toISOString() : new Date(timestamp).toISOString(),
+  };
+}
 
 /** Thinking levels accepted by the pi runtime. */
 export type AgentThinkingLevel = NonNullable<
@@ -242,12 +279,14 @@ export class AgentRun {
 
   private readonly tools: string[];
   private readonly approvals: ApprovalManager;
+  private readonly store: SqliteStore | undefined;
   private session: AgentSession | undefined;
   private unsubscribe: (() => void) | undefined;
   private unsubscribeApprovals: (() => void) | undefined;
   private readonly events: AgentEventRecord[] = [];
   private readonly listeners = new Set<(event: AgentEventRecord) => void>();
   private activeRun: Promise<void> | undefined;
+  private turnStartedAt: number | undefined;
   private seq = 0;
   private statusValue: AgentRunStatus = 'starting';
   private lastError: string | undefined;
@@ -257,6 +296,7 @@ export class AgentRun {
     request: AgentRunRequest,
     defaults: AgentRunDefaults,
     approvals: ApprovalManager,
+    store?: SqliteStore,
   ) {
     this.id = randomUUID();
     this.createdAt = new Date().toISOString();
@@ -264,6 +304,7 @@ export class AgentRun {
     this.request = request;
     this.tools = request.tools ?? defaults.tools;
     this.approvals = approvals;
+    this.store = store;
     this.turnApprovals = new AgentTurnApprovals(approvals, this.id);
     this.unsubscribeApprovals = approvals.subscribe((event) => {
       if (event.approval.runId !== this.id) return;
@@ -276,8 +317,9 @@ export class AgentRun {
     request: AgentRunRequest,
     defaults: AgentRunDefaults,
     approvals: ApprovalManager,
+    store?: SqliteStore,
   ): Promise<AgentRun> {
-    const run = new AgentRun(request, defaults, approvals);
+    const run = new AgentRun(request, defaults, approvals, store);
     try {
       await run.initialize(modelRuntime, defaults);
       return run;
@@ -350,9 +392,21 @@ export class AgentRun {
   private handleEvent(event: AgentSessionEvent): void {
     this.recordEvent(event.type, serializePayload(event));
 
+    if (event.type === 'message_end') {
+      const usage = usageLedgerEntryFromAssistantMessage(this.id, event.message, this.turnStartedAt === undefined ? undefined : Date.now() - this.turnStartedAt);
+      if (usage) {
+        try {
+          this.store?.appendUsage(usage);
+        } catch (error) {
+          console.warn('[warn] failed to persist usage ledger:', error);
+        }
+      }
+    }
+
     if (event.type === 'agent_start') {
       this.statusValue = 'running';
     } else if (event.type === 'turn_start') {
+      this.turnStartedAt = Date.now();
       this.turnApprovals.onTurnStart();
     } else if (event.type === 'agent_settled' && this.statusValue !== 'closed') {
       this.statusValue = 'idle';
