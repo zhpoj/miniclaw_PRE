@@ -3,6 +3,7 @@ import { serve } from '@hono/node-server';
 import { createApp } from './app.js';
 import { createEngineFromEnv } from './agent/engine.js';
 import { getMountedIM, startMountedIM, stopMountedIM } from './im/index.js';
+import { createServerListenOptions } from './server-config.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const engine = createEngineFromEnv();
@@ -14,7 +15,7 @@ const info = engine.describe();
 const server = serve(
   {
     fetch: app.fetch,
-    port,
+    ...createServerListenOptions(port),
   },
   (serverInfo) => {
     console.log(

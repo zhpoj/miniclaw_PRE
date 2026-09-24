@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { AgentEngine, ENGINE_NAME } from '../src/agent/engine.js';
+import { ApprovalManager } from '../src/agent/approval.js';
 import { createApp } from '../src/app.js';
 
 const engine = new AgentEngine();
@@ -11,6 +12,30 @@ afterAll(async () => {
 });
 
 describe('agent engine', () => {
+  it('releases approval listeners when run initialization fails', async () => {
+    class TrackingApprovalManager extends ApprovalManager {
+      activeListeners = 0;
+
+      override subscribe(listener: Parameters<ApprovalManager['subscribe']>[0]): () => void {
+        this.activeListeners += 1;
+        const unsubscribe = super.subscribe(listener);
+        return () => {
+          this.activeListeners -= 1;
+          unsubscribe();
+        };
+      }
+    }
+
+    const approvals = new TrackingApprovalManager();
+    const failingEngine = new AgentEngine({ approvals });
+
+    await expect(
+      failingEngine.createRun({ model: '__missing__/__missing__' }),
+    ).rejects.toMatchObject({ code: 'model_unresolved' });
+    expect(approvals.activeListeners).toBe(0);
+    await failingEngine.closeAll();
+  }, 60_000);
+
   it('reports the pi engine in the agent health endpoint', async () => {
     const response = await app.request('/api/agent/health');
 

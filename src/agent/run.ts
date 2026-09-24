@@ -93,6 +93,62 @@ interface ActiveTurn {
   source: PromptSource;
 }
 
+interface QueuedTurn {
+  token: string;
+  source: PromptSource;
+}
+
+export class AgentTurnApprovals {
+  private active: ActiveTurn | undefined;
+  private readonly queued: QueuedTurn[] = [];
+  private waitingForInitialTurnStart = false;
+
+  constructor(
+    private readonly approvals: ApprovalManager,
+    private readonly runId: string,
+  ) {}
+
+  current(): ActiveTurn | undefined {
+    return this.active;
+  }
+
+  start(source: PromptSource): void {
+    this.replace(source, true);
+  }
+
+  queue(source: PromptSource): () => void {
+    const entry = { token: randomUUID(), source };
+    this.queued.push(entry);
+    return () => {
+      const index = this.queued.findIndex((candidate) => candidate.token === entry.token);
+      if (index !== -1) this.queued.splice(index, 1);
+    };
+  }
+
+  onTurnStart(): void {
+    if (this.waitingForInitialTurnStart) {
+      this.waitingForInitialTurnStart = false;
+      return;
+    }
+    const source = this.queued.shift()?.source ?? this.active?.source ?? 'web';
+    this.replace(source, false);
+  }
+
+  end(reason: string): void {
+    if (this.active) this.approvals.endTurn(this.runId, reason);
+    this.active = undefined;
+    this.queued.splice(0);
+    this.waitingForInitialTurnStart = false;
+  }
+
+  private replace(source: PromptSource, waitingForInitialTurnStart: boolean): void {
+    if (this.active) this.approvals.endTurn(this.runId, '上一轮任务已结束');
+    this.active = { id: randomUUID(), source };
+    this.waitingForInitialTurnStart = waitingForInitialTurnStart;
+    this.approvals.beginTurn(this.runId, this.active.id, source);
+  }
+}
+
 const APPROVAL_TOOLS = new Set(['edit', 'write', 'powershell']);
 
 export function createApprovalExtension(context: {
@@ -177,7 +233,7 @@ export class AgentRun {
   private seq = 0;
   private statusValue: AgentRunStatus = 'starting';
   private lastError: string | undefined;
-  private activeTurn: ActiveTurn | undefined;
+  private readonly turnApprovals: AgentTurnApprovals;
 
   private constructor(
     request: AgentRunRequest,
@@ -190,6 +246,7 @@ export class AgentRun {
     this.request = request;
     this.tools = request.tools ?? defaults.tools;
     this.approvals = approvals;
+    this.turnApprovals = new AgentTurnApprovals(approvals, this.id);
     this.unsubscribeApprovals = approvals.subscribe((event) => {
       if (event.approval.runId !== this.id) return;
       this.recordEvent(event.type, { approval: event.approval });
@@ -203,8 +260,13 @@ export class AgentRun {
     approvals: ApprovalManager,
   ): Promise<AgentRun> {
     const run = new AgentRun(request, defaults, approvals);
-    await run.initialize(modelRuntime, defaults);
-    return run;
+    try {
+      await run.initialize(modelRuntime, defaults);
+      return run;
+    } catch (error) {
+      run.close();
+      throw error;
+    }
   }
 
   private async initialize(
@@ -245,7 +307,7 @@ export class AgentRun {
         approvals: this.approvals,
         runId: this.id,
         cwd: this.cwd,
-        getTurn: () => this.activeTurn,
+        getTurn: () => this.turnApprovals.current(),
       }),
     };
     const loader = new DefaultResourceLoader({
@@ -270,6 +332,8 @@ export class AgentRun {
 
     if (event.type === 'agent_start') {
       this.statusValue = 'running';
+    } else if (event.type === 'turn_start') {
+      this.turnApprovals.onTurnStart();
     } else if (event.type === 'agent_settled' && this.statusValue !== 'closed') {
       this.statusValue = 'idle';
       this.endActiveTurn('当前任务已结束');
@@ -360,18 +424,20 @@ export class AgentRun {
       if (behavior === 'steer') {
         await session.steer(text);
       } else {
-        await session.followUp(text);
+        const cancelQueuedTurn = this.turnApprovals.queue(options.source ?? 'web');
+        try {
+          await session.followUp(text);
+        } catch (error) {
+          cancelQueuedTurn();
+          throw error;
+        }
       }
       return { accepted: true, mode: 'queued' };
     }
 
     this.lastError = undefined;
     this.statusValue = 'running';
-    this.activeTurn = {
-      id: randomUUID(),
-      source: options.source ?? 'web',
-    };
-    this.approvals.beginTurn(this.id, this.activeTurn.id, this.activeTurn.source);
+    this.turnApprovals.start(options.source ?? 'web');
 
     const promise = session
       .prompt(
@@ -437,8 +503,6 @@ export class AgentRun {
   }
 
   private endActiveTurn(reason: string): void {
-    if (!this.activeTurn) return;
-    this.activeTurn = undefined;
-    this.approvals.endTurn(this.id, reason);
+    this.turnApprovals.end(reason);
   }
 }
