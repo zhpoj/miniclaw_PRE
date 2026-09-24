@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
 
 export interface StoredMessageInput {
   channelId: string;
@@ -15,6 +15,13 @@ export interface StoredMessageInput {
   content: string;
   status?: string;
   runId?: string;
+}
+
+export interface StoredConversation {
+  id: string;
+  channelId: string;
+  conversationId: string;
+  sessionFile: string | undefined;
 }
 
 export class SqliteStore {
@@ -59,6 +66,28 @@ export class SqliteStore {
       VALUES (?, ?, ?, ?, ?)
     `).run(id, channelId, conversationId, now, now);
     return id;
+  }
+
+  getConversation(channelId: string, conversationId: string): StoredConversation | undefined {
+    const row = this.db.prepare(`
+      SELECT id, channel_id, conversation_id, session_file
+      FROM conversations WHERE channel_id = ? AND conversation_id = ?
+    `).get(channelId, conversationId) as {
+      id: string; channel_id: string; conversation_id: string; session_file: string | null;
+    } | undefined;
+    if (!row) return undefined;
+    return {
+      id: row.id,
+      channelId: row.channel_id,
+      conversationId: row.conversation_id,
+      sessionFile: row.session_file ?? undefined,
+    };
+  }
+
+  setConversationSessionFile(channelId: string, conversationId: string, sessionFile: string): void {
+    const id = this.ensureConversation(channelId, conversationId);
+    this.db.prepare('UPDATE conversations SET session_file = ?, updated_at = ? WHERE id = ?')
+      .run(sessionFile, new Date().toISOString(), id);
   }
 
   appendMessage(input: StoredMessageInput): string {
@@ -106,6 +135,7 @@ export class SqliteStore {
         channel_id TEXT NOT NULL,
         conversation_id TEXT NOT NULL,
         session_id TEXT,
+        session_file TEXT,
         workspace_id TEXT,
         agent_profile_id TEXT,
         status TEXT NOT NULL DEFAULT 'active',
@@ -149,6 +179,12 @@ export class SqliteStore {
         updated_at TEXT NOT NULL
       );
     `);
+    if (version < 2) {
+      const columns = this.db.prepare('PRAGMA table_info(conversations)').all() as Array<{ name: string }>;
+      if (!columns.some((column) => column.name === 'session_file')) {
+        this.db.exec('ALTER TABLE conversations ADD COLUMN session_file TEXT');
+      }
+    }
     this.db.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)').run(
       CURRENT_SCHEMA_VERSION,
       new Date().toISOString(),

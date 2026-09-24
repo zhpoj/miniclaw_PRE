@@ -39,6 +39,8 @@ export interface AgentRunRequest {
   systemPrompt?: string | undefined;
   /** Persist the pi session to disk instead of keeping it in memory. */
   persistSession?: boolean | undefined;
+  /** Existing persisted session file to reopen. */
+  sessionFile?: string | undefined;
 }
 
 /** Engine level defaults applied to every run. */
@@ -294,7 +296,9 @@ export class AgentRun {
       modelRuntime,
       tools: this.tools,
       sessionManager: this.request.persistSession ?? defaults.persistSessions
-        ? SessionManager.create(this.cwd)
+        ? this.request.sessionFile
+          ? SessionManager.open(this.request.sessionFile)
+          : SessionManager.create(this.cwd)
         : SessionManager.inMemory(this.cwd),
     };
 

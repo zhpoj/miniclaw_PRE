@@ -481,11 +481,25 @@ export class IMBridge {
 
   private async resolveRun(binding: ConversationBinding): Promise<IMRun> {
     if (binding.run) return binding.run;
+    const persisted = this.store?.getConversation(binding.channelId, binding.conversationId);
     binding.creating ??= this.engine
-      .createRun({})
+      .createRun({
+        ...(this.store ? { persistSession: true } : {}),
+        ...(persisted?.sessionFile ? { sessionFile: persisted.sessionFile } : {}),
+      })
       .then((run: IMRun) => {
         binding.run = run;
         binding.creating = undefined;
+        if (this.store) {
+          const sessionFile = run.snapshot().piSessionFile;
+          if (sessionFile) {
+            this.store.setConversationSessionFile(
+              binding.channelId,
+              binding.conversationId,
+              sessionFile,
+            );
+          }
+        }
         return run;
       })
       .catch((error: unknown) => {

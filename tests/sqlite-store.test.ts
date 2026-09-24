@@ -19,7 +19,7 @@ describe('SqliteStore', () => {
     const store = new SqliteStore(join(dir, 'data', 'db', 'messages.db'));
 
     expect(store.path).toContain('messages.db');
-    expect(store.schemaVersion()).toBe(1);
+    expect(store.schemaVersion()).toBe(2);
     expect(store.tables()).toEqual(expect.arrayContaining([
       'schema_migrations', 'conversations', 'messages', 'workspaces', 'agent_profiles',
     ]));
@@ -33,7 +33,7 @@ describe('SqliteStore', () => {
     const first = new SqliteStore(path);
     first.close();
     const second = new SqliteStore(path);
-    expect(second.schemaVersion()).toBe(1);
+    expect(second.schemaVersion()).toBe(2);
     second.close();
   });
 
@@ -52,6 +52,16 @@ describe('SqliteStore', () => {
     expect(store.appendMessage(input)).toBe(store.appendMessage(input));
     const row = store.db.prepare('SELECT COUNT(*) AS count FROM messages').get() as { count: number };
     expect(Number(row.count)).toBe(1);
+    store.close();
+  });
+
+  it('stores the Agent session file for restart recovery', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'miniclaw-db-'));
+    dirs.push(dir);
+    const store = new SqliteStore(join(dir, 'data', 'db', 'messages.db'));
+    store.ensureConversation('feishu', 'oc_1');
+    store.setConversationSessionFile('feishu', 'oc_1', 'C:\\sessions\\one.jsonl');
+    expect(store.getConversation('feishu', 'oc_1')?.sessionFile).toBe('C:\\sessions\\one.jsonl');
     store.close();
   });
 });
