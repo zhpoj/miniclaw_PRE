@@ -4,10 +4,12 @@ import { createApp } from './app.js';
 import { createEngineFromEnv } from './agent/engine.js';
 import { getMountedIM, startMountedIM, stopMountedIM } from './im/index.js';
 import { createServerListenOptions } from './server-config.js';
+import { SqliteStore } from './storage/sqlite.js';
 
 const port = Number(process.env.PORT ?? 3000);
 const engine = createEngineFromEnv();
-const app = createApp({ engine });
+const store = new SqliteStore();
+const app = createApp({ engine, store });
 const im = getMountedIM(app);
 
 const info = engine.describe();
@@ -64,6 +66,7 @@ function shutdown(signal: string): void {
       console.error('Failed to close agent runs:', error);
     })
     .finally(() => {
+      store.close();
       server.close(() => process.exit(0));
       setTimeout(() => process.exit(0), 2000).unref();
     });

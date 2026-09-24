@@ -14,6 +14,7 @@
 import type { AgentEngine } from '../agent/engine.js';
 import type { AgentEventRecord, AgentRun } from '../agent/run.js';
 import type { ApprovalEvent, ApprovalManager, ApprovalRecord } from '../agent/approval.js';
+import type { SqliteStore } from '../storage/sqlite.js';
 import { buildApprovalCard } from './approval-card.js';
 import type { CardAction, IMChannel, InboundMessage, OutboundContent } from './IMChannel.js';
 
@@ -26,6 +27,8 @@ export type IMRun = Pick<
 >;
 
 export interface IMBridgeOptions {
+  /** Optional durable runtime store. */
+  store?: SqliteStore;
   /** Give up on a turn that has not settled in time (ms). 0 disables the guard. */
   turnTimeoutMs: number;
   /** How many messages may wait behind an in-flight turn. */
@@ -111,6 +114,7 @@ export interface ConversationSnapshot {
 export class IMBridge {
   private readonly engine: IMBridgeEngine;
   private readonly approvals: ApprovalManager;
+  private readonly store: SqliteStore | undefined;
   private readonly options: IMBridgeOptions;
   private readonly channels = new Map<string, IMChannel>();
   private readonly subscriptions = new Map<string, () => void>();
@@ -122,6 +126,7 @@ export class IMBridge {
   constructor(engine: IMBridgeEngine, options: Partial<IMBridgeOptions> = {}) {
     this.engine = engine;
     this.approvals = engine.getApprovalManager();
+    this.store = options.store;
     this.options = { ...DEFAULT_IM_BRIDGE_OPTIONS, ...options };
     this.unsubscribeApprovals = this.approvals.subscribe((event) => {
       this.onApprovalEvent(event);
@@ -176,6 +181,7 @@ export class IMBridge {
 
     const binding = this.ensureBinding(message);
     binding.updatedAt = Date.now();
+    this.recordInbound(message, binding.run?.id);
 
     const text = message.text.trim();
     if (text.startsWith('/')) {
@@ -529,13 +535,46 @@ export class IMBridge {
     content: OutboundContent,
   ): Promise<{ messageId: string } | undefined> {
     try {
-      return await channel.send(conversationId, content);
+      const sent = await channel.send(conversationId, content);
+      if (this.store) {
+        try {
+          this.store.appendMessage({
+            channelId: channel.id,
+            conversationId,
+            channelMessageId: sent.messageId,
+            direction: 'outbound',
+            messageType: content.card ? 'card' : 'text',
+            content: content.card ? JSON.stringify(content.card) : content.text ?? '',
+            status: 'sent',
+          });
+        } catch (error) {
+          console.error('[im] failed to persist outbound message:', describeError(error));
+        }
+      }
+      return sent;
     } catch (error) {
       console.error(
         `[im] failed to send into ${channel.id}:${conversationId}:`,
         describeError(error),
       );
       return undefined;
+    }
+  }
+
+  private recordInbound(message: InboundMessage, runId: string | undefined): void {
+    if (!this.store) return;
+    try {
+      this.store.appendMessage({
+        channelId: message.channelId,
+        conversationId: message.conversationId,
+        channelMessageId: message.messageId,
+        senderId: message.senderId,
+        direction: 'inbound',
+        content: message.text,
+        ...(runId ? { runId } : {}),
+      });
+    } catch (error) {
+      console.error('[im] failed to persist inbound message:', describeError(error));
     }
   }
 

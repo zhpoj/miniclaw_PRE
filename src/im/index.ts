@@ -9,6 +9,7 @@ import {
 } from './bridge.js';
 import type { IMChannel, InboundMessage } from './IMChannel.js';
 import { createFeishuConfigFromEnv, FeishuChannel } from './feishu.js';
+import type { SqliteStore } from '../storage/sqlite.js';
 
 /** Side registry so callers can reach whatever `mountIMChannels` created. */
 const mounted = new WeakMap<Hono, MountedIM>();
@@ -19,6 +20,8 @@ export function getMountedIM(app: Hono): MountedIM | undefined {
 }
 
 export interface MountIMOptions {
+  /** Durable runtime state store shared by all channels. */
+  store?: SqliteStore | undefined;
   /**
    * Agent engine inbound messages are forwarded to. When omitted the channels
    * still mount (health + webhook plumbing) but nobody consumes the messages.
@@ -52,7 +55,10 @@ export async function stopMountedIM(im: MountedIM | undefined): Promise<void> {
 export function mountIMChannels(app: Hono, options: MountIMOptions = {}): MountedIM {
   const channels: IMChannel[] = [];
   const bridge = options.engine
-    ? new IMBridge(options.engine, createIMBridgeOptionsFromEnv())
+    ? new IMBridge(options.engine, {
+        ...createIMBridgeOptionsFromEnv(),
+        ...(options.store ? { store: options.store } : {}),
+      })
     : undefined;
 
   if (bridge) {

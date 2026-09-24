@@ -7,6 +7,7 @@ import { ApprovalError } from './agent/approval.js';
 import { AgentEngine, createEngineFromEnv, ENGINE_NAME } from './agent/engine.js';
 import { AgentEngineError } from './agent/run.js';
 import { mountIMChannels } from './im/index.js';
+import type { SqliteStore } from './storage/sqlite.js';
 
 const createRunSchema = z.object({
   cwd: z.string().min(1).optional(),
@@ -37,6 +38,7 @@ const sinceSchema = z.coerce.number().int().min(0).default(0);
 
 export interface CreateAppOptions {
   engine?: AgentEngine;
+  store?: SqliteStore;
 }
 
 export function createApp(options: CreateAppOptions = {}) {
@@ -250,7 +252,7 @@ export function createApp(options: CreateAppOptions = {}) {
 
   // IM channels are opt-in: each one mounts only when its credentials are in the env.
   // With the engine present, inbound messages are forwarded to per-conversation agent runs.
-  mountIMChannels(app, { engine });
+  mountIMChannels(app, { engine, ...(options.store ? { store: options.store } : {}) });
 
   return app;
 }

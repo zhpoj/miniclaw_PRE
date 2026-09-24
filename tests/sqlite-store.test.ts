@@ -36,4 +36,22 @@ describe('SqliteStore', () => {
     expect(second.schemaVersion()).toBe(1);
     second.close();
   });
+
+  it('deduplicates inbound channel messages', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'miniclaw-db-'));
+    dirs.push(dir);
+    const store = new SqliteStore(join(dir, 'data', 'db', 'messages.db'));
+    const input = {
+      channelId: 'feishu',
+      conversationId: 'oc_1',
+      channelMessageId: 'om_1',
+      senderId: 'ou_1',
+      direction: 'inbound' as const,
+      content: 'hello',
+    };
+    expect(store.appendMessage(input)).toBe(store.appendMessage(input));
+    const row = store.db.prepare('SELECT COUNT(*) AS count FROM messages').get() as { count: number };
+    expect(Number(row.count)).toBe(1);
+    store.close();
+  });
 });
